@@ -1674,13 +1674,14 @@ impl TokenPattern {
 /// C++ static `TokenPattern::buildSingle(int4 startbit,int4 endbit,uintm
 /// byteval)`: a mask/value pattern within a single word.  bit 0 is the MOST
 /// significant bit of the word.
-fn build_single(mut startbit: i32, mut endbit: i32, mut byteval: u32) -> PatternBlock {
+fn build_single(mut startbit: i32, endbit: i32, mut byteval: u32) -> PatternBlock {
     let mut offset = 0;
     let size = endbit - startbit + 1;
+    // C++ lowers `endbit` by 8 in this loop as well; nothing reads it after
+    // `size`, so the port leaves it.
     while startbit >= 8 {
         offset += 1;
         startbit -= 8;
-        endbit -= 8;
     }
     // shift count in [0,32) for valid fields
     let mut mask: u32 = (!0u32).wshl((32 - size) as u32);
