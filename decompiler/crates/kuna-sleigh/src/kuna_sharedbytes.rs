@@ -17,7 +17,6 @@ use std::sync::Arc;
 use kuna_base::address::Address;
 use kuna_base::error::{KunaError, KunaResult};
 use kuna_base::space::AddrSpace;
-use kuna_base::types::Wrap;
 
 use crate::loadimage::{ImageBytes, LoadImage, IMAGE_WINDOW_BYTES};
 
