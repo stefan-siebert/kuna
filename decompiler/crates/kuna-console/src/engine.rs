@@ -4072,6 +4072,26 @@ pub fn bootstrap_from_image_with_isa(
     }
 }
 
+/// [`bootstrap_from_image_with_isa`] over an image a caller has already read:
+/// for a host that hands the bytes over instead of a path its process could
+/// open (a sandboxed one). `name` stands where the path would — in notes and
+/// diagnostics — and is never opened.
+pub fn bootstrap_from_image_bytes_with_isa(
+    name: &str,
+    bytes: Vec<u8>,
+    target: &str,
+    spec_roots: &[String],
+    isa: Option<ArmIsa>,
+) -> KunaResult<ConsoleProgram> {
+    if is_te_image(&bytes) {
+        bootstrap_from_te_bytes(name, &bytes, target, spec_roots, isa)
+    } else if is_mz_dos_image(&bytes) {
+        bootstrap_from_mz_bytes(name, &bytes, target, spec_roots, isa)
+    } else {
+        bootstrap_from_object_bytes_with_isa(name, bytes, target, spec_roots, isa)
+    }
+}
+
 /// The file's bytes when it is a plain DOS `MZ` executable. A PE is turned
 /// away on its `e_lfanew` signature before the whole file is read.
 fn file_mz_dos_image(path: &str) -> Option<Vec<u8>> {
@@ -4337,13 +4357,24 @@ pub fn bootstrap_from_object_with_isa(
     spec_roots: &[String],
     isa: Option<ArmIsa>,
 ) -> KunaResult<ConsoleProgram> {
-    let target = kuna_analysis::loadimage_object::explicit_language_target(target).unwrap_or("");
-    let registry = build_registry();
-
     // Read the image bytes once: reused for the loader AND the analysis-pass
     // object::File view (the analyzers need a parsed object the loader drops).
     let bytes = std::fs::read(path)
         .map_err(|e| KunaError::lowlevel(format!("Unable to open image file: {path}: {e}")))?;
+    bootstrap_from_object_bytes_with_isa(path, bytes, target, spec_roots, isa)
+}
+
+/// [`bootstrap_from_object_with_isa`] over bytes a caller has already read;
+/// `path` names the image and is never opened.
+pub fn bootstrap_from_object_bytes_with_isa(
+    path: &str,
+    bytes: Vec<u8>,
+    target: &str,
+    spec_roots: &[String],
+    isa: Option<ArmIsa>,
+) -> KunaResult<ConsoleProgram> {
+    let target = kuna_analysis::loadimage_object::explicit_language_target(target).unwrap_or("");
+    let registry = build_registry();
     // (PR-8) Mach-O fat / universal (`0xcafebabe`) peel: `object::File::parse`
     // is a thin, single-arch view and cannot parse a fat header, so a universal
     // binary is reduced to ONE arch slice's bytes here — the single, canonical
