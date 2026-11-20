@@ -65,7 +65,7 @@ pub struct PendingCallFixup {
 /// constant).  The `aliascheck` is the deferred-gather local alias checker
 /// (`AliasChecker::gather(..., defer=true)`), supplied by the caller, and
 /// `held` the (kuna `calleeargs`) bound guard's index for this pass.
-pub fn check_input_trial_use(
+pub(crate) fn check_input_trial_use(
     idx: int4,
     data: &mut Funcdata,
     aliascheck: &mut AliasChecker,
