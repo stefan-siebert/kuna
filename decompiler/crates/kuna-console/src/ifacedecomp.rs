@@ -147,6 +147,12 @@ pub struct IfaceDecompData {
     /// precedent).
     pub pending_flow_overrides:
         std::collections::BTreeMap<String, Vec<(kuna_base::address::Address, kuna_base::types::uint4)>>,
+    /// The `override indirect <callsite> <callee>` commands given, keyed by
+    /// function name, as `(call site, callee as typed)`: what a refusal after
+    /// the decompile is reported against. The facts themselves are parked on
+    /// the architecture.
+    pub pending_callee_overrides:
+        std::collections::BTreeMap<String, Vec<(kuna_base::address::Address, String)>>,
     /// Prototype overrides installed by `override prototype <addr> <decl>`, keyed
     /// by function name.  C++ keeps these on `dcp->fd->getOverride()` (the Funcdata
     /// is reused); the kuna console rebuilds the IR on `decompile`, so the
@@ -169,10 +175,19 @@ pub struct IfaceDecompData {
         String,
         Vec<(kuna_base::types::int4, String, kuna_decomp::fspec::ParameterPieces)>,
     >,
+    /// Explicit stable local renames and retypes, keyed by the function's entry.
+    pub local_edit_names: std::collections::BTreeMap<
+        kuna_base::address::Address,
+        kuna_decomp::kuna_stablenames::PriorNames,
+    >,
     /// (kuna) What the last `load function` / `load addr` followed, so the very
     /// next `decompile` can adopt that IR instead of following the same flow a
     /// second time.  See [`PristineFlow`].
     pub pristine_flow: Option<PristineFlow>,
+    /// (kuna decompile-all watchdog) The flow a `decompile` stopped at its
+    /// budget or memory limit left out of the shell in `fd`, which
+    /// [`Self::follow_stopped_flow`] follows for a command that reads the IR.
+    pub stopped_flow: Option<PristineFlow>,
     /// (kuna) How many times a `decompile` adopted the loaded IR instead of
     /// re-following the flow.  Observability only -- nothing reads it to make a
     /// decision; it is what lets a test assert the fast path was actually taken
@@ -184,6 +199,9 @@ pub struct IfaceDecompData {
     /// (kuna) What the last `decompile` must print for those lines, which the
     /// next `print C` checks (`assertions::check_printed`).
     pub printed_checks: Option<(Vec<String>, Vec<crate::assertions::Expected>)>,
+    /// (kuna) The `force constant` requests applied since the last
+    /// `decompile` (address, format, value), which that `decompile` checks.
+    pub pending_format_checks: Vec<(kuna_base::address::Address, String, Option<u64>)>,
 }
 
 /// (kuna) The provenance stamp of the `Funcdata` currently in `dcp.fd`, recorded
@@ -291,6 +309,34 @@ impl IfaceDecompData {
         })
     }
 
+    fn remember_local_edit(&mut self) {
+        let Some(fd) = self.fd.as_ref() else { return };
+        let names = kuna_decomp::kuna_stablenames::carry(fd);
+        if names.renames.is_empty() && names.symbol_renames.is_empty() && names.retypes.is_empty() {
+            self.local_edit_names.remove(fd.get_address());
+        } else {
+            self.local_edit_names.insert(fd.get_address().clone(), names);
+        }
+    }
+
+    fn local_names_for_rebuild(&self) -> kuna_decomp::kuna_stablenames::PriorNames {
+        let Some(fd) = self.fd.as_ref() else { return Default::default() };
+        let names = kuna_decomp::kuna_stablenames::carry(fd);
+        if names.is_empty() {
+            self.local_edit_names.get(fd.get_address()).cloned().unwrap_or(names)
+        } else {
+            names
+        }
+    }
+
+    fn select_loaded_function(&mut self, fd: Funcdata) {
+        let entry = fd.get_address();
+        if self.fd.as_ref().is_some_and(|current| current.get_address() == entry) {
+            self.local_edit_names.remove(entry);
+        }
+        self.fd = Some(fd);
+    }
+
     /// C++ `IfaceDecompData::clearArchitecture()`.
     ///
     /// Upstream keeps prototypes, overrides and storage locks on the
@@ -303,11 +349,41 @@ impl IfaceDecompData {
         self.pending_prototypes.clear();
         self.pending_prototype_entries.clear();
         self.pending_flow_overrides.clear();
+        self.pending_callee_overrides.clear();
         self.pending_proto_overrides.clear();
         self.pending_param_maps.clear();
+        self.local_edit_names.clear();
         self.pristine_flow = None;
+        self.stopped_flow = None;
         self.pending_local_checks.clear();
+        self.pending_format_checks.clear();
         self.printed_checks = None;
+    }
+
+    /// (kuna decompile-all watchdog) Follow the flow a budget-stopped
+    /// `decompile` left out of the shell in `fd`, for a command that reads the
+    /// IR (`print raw`, the `region` commands), which then prints what it did
+    /// when the stop followed the flow again at once.
+    pub fn follow_stopped_flow(&mut self) {
+        let Some(recipe) = self.stopped_flow.take() else { return };
+        let (Some(prog), Some(shell)) = (self.conf.as_mut(), self.fd.as_ref()) else { return };
+        if shell.get_address() != &recipe.entry || !shell.obank().empty() {
+            return;
+        }
+        let reason = shell.kuna_pipeline_failure().map(str::to_string);
+        let followed = build_and_follow_flow_with_override(
+            prog.arch_mut(),
+            &recipe.name,
+            recipe.entry,
+            recipe.size,
+            &recipe.flow_overrides,
+        );
+        if let Ok(mut fd) = followed {
+            if let Some(reason) = reason {
+                fd.set_kuna_pipeline_failure(&reason);
+            }
+            self.fd = Some(fd);
+        }
     }
 }
 
@@ -950,11 +1026,18 @@ decomp_command!(
     IfcOption,
     fn execute(&self, status: &mut IfaceStatus, s: &mut CommandStream) -> IfaceResult<()> {
         let dcp = dcp_mut(status)?;
-        if dcp.conf.is_none() {
-            return Err(IfaceError::execution("No load image present"));
-        }
         s.skip_ws();
         let optname = s.read_token();
+        if dcp.conf.is_none() {
+            s.skip_ws();
+            let value = s.read_token();
+            let Some(res) = kuna_decomp::kuna_dyldcache::set_option(&optname, &value) else {
+                return Err(IfaceError::execution("No load image present"));
+            };
+            let res = res.map_err(|e| IfaceError::execution(e.explain().to_string()))?;
+            status.out(&format!("{res}\n"));
+            return Ok(());
+        }
         s.skip_ws();
         if optname.is_empty() {
             return Err(IfaceError::parse("Missing option name"));
@@ -1277,6 +1360,7 @@ decomp_command!(
         .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
         // (kuna) Stamp the follow so an immediately-following `decompile` can adopt
         // this IR rather than following the same flow again (see `PristineFlow`).
+        dcp.stopped_flow = None;
         dcp.pristine_flow = Some(PristineFlow {
             command_seq,
             name: resolved_name,
@@ -1284,8 +1368,9 @@ decomp_command!(
             size: declared,
             flow_overrides,
         });
-        dcp.fd = Some(fd);
+        dcp.select_loaded_function(fd);
         dcp.pending_local_checks.clear();
+        dcp.pending_format_checks.clear();
         dcp.printed_checks = None;
         Ok(())
     }
@@ -1380,6 +1465,7 @@ decomp_command!(
             build_and_follow_flow_within_budget(prog.arch_mut(), &name, offset, declared, &flow_overrides)
                 .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
         // (kuna) Same follow stamp as `load function` (see `PristineFlow`).
+        dcp.stopped_flow = None;
         dcp.pristine_flow = Some(PristineFlow {
             command_seq,
             name: name_stamp,
@@ -1387,8 +1473,9 @@ decomp_command!(
             size: declared,
             flow_overrides,
         });
-        dcp.fd = Some(fd);
+        dcp.select_loaded_function(fd);
         dcp.pending_local_checks.clear();
+        dcp.pending_format_checks.clear();
         dcp.printed_checks = None;
         Ok(())
     }
@@ -1397,7 +1484,9 @@ decomp_command!(
 // --- read symbols / clear architecture (ifacedecomp.cc:529, 518) -----------
 
 decomp_command!(
-    /// C++ `IfcReadSymbols`: read symbols from the load image.
+    /// C++ `IfcReadSymbols`: read symbols from the load image. (kuna) Prints a
+    /// `warning:` line for each configured `.fid` database the commit did not
+    /// match against.
     IfcReadSymbols,
     fn execute(&self, status: &mut IfaceStatus, _s: &mut CommandStream) -> IfaceResult<()> {
         let dcp = dcp_mut(status)?;
@@ -1420,6 +1509,11 @@ decomp_command!(
         let prog = dcp.conf.as_mut().expect("conf checked non-None above");
         prog.commit_pending_analysis()
             .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
+        let fid_warnings: Vec<String> =
+            prog.fid_databases().iter().filter_map(|report| report.warning()).collect();
+        for warning in fid_warnings {
+            status.out(&format!("warning: {warning}\n"));
+        }
         Ok(())
     }
 );
@@ -2177,11 +2271,7 @@ decomp_command!(
             }
             carried
         };
-        let prior_names = dcp_mut(status)?
-            .fd
-            .as_ref()
-            .map(kuna_decomp::kuna_stablenames::carry)
-            .unwrap_or_default();
+        let prior_names = dcp_mut(status)?.local_names_for_rebuild();
         let (check_lines, expected) = {
             let dcp = dcp_mut(status)?;
             let pending = std::mem::take(&mut dcp.pending_local_checks);
@@ -2190,6 +2280,7 @@ decomp_command!(
             let expected = dcp.fd.as_ref().map(|fd| crate::assertions::expected_locals(fd, &touched)).unwrap_or_default();
             (pending.into_iter().map(|(line, ..)| line).collect::<Vec<_>>(), expected)
         };
+        let format_checks = std::mem::take(&mut dcp_mut(status)?.pending_format_checks);
         // The `override prototype` facts stashed for this function (re-seeded on the
         // rebuilt IR), consumed at flow time as `Override::applyPrototype`.  The
         // shared decompile step may discover further per-call-site printf/scanf
@@ -2329,20 +2420,32 @@ decomp_command!(
                 .push((callpoint, pieces));
         }
         // Restore the program (and the fresh Funcdata on success) regardless.
-        if result.is_err() {
+        if let (Err(error), Some(recipe)) = (&result, adopted_recipe) {
             // Re-follow the adopted IR so the console is left holding the same
             // un-decompiled `dcp.fd` the rebuild path would have left (see
-            // `adopted_recipe`).  `None` whenever nothing was adopted.
-            if let Some(recipe) = &adopted_recipe {
-                if let Ok(fd) = build_and_follow_flow_with_override(
-                    prog.arch_mut(),
+            // `adopted_recipe`).  A drive stopped at its budget or memory limit
+            // keeps a shell built without following again: that follow would
+            // run past the limit that just stopped the drive.  A command that
+            // reads the IR follows it then (`follow_stopped_flow`).
+            if kuna_decomp::decompile_drive::is_budget_stop(error) {
+                if let Ok(fd) = kuna_decomp::decompile_drive::budget_stop_shell(
+                    prog.arch(),
                     &recipe.name,
                     recipe.entry.clone(),
                     recipe.size,
-                    &recipe.flow_overrides,
                 ) {
-                    dcp_mut(status)?.fd = Some(fd);
+                    let dcp = dcp_mut(status)?;
+                    dcp.fd = Some(fd);
+                    dcp.stopped_flow = Some(recipe);
                 }
+            } else if let Ok(fd) = build_and_follow_flow_with_override(
+                prog.arch_mut(),
+                &recipe.name,
+                recipe.entry.clone(),
+                recipe.size,
+                &recipe.flow_overrides,
+            ) {
+                dcp_mut(status)?.fd = Some(fd);
             }
         }
         let dcp = dcp_mut(status)?;
@@ -2364,9 +2467,32 @@ decomp_command!(
                             kuna_decomp::overrides::Override::type_to_string(*type_)
                         )
                     })
+                    .chain(fd.kuna_rejected_callee_overrides().iter().flat_map(|(site, _, reason)| {
+                        dcp.pending_callee_overrides
+                            .get(&name)
+                            .into_iter()
+                            .flatten()
+                            .filter(move |(at, _)| at == site)
+                            .map(move |(at, callee)| {
+                                format!(
+                                    "Rejected override indirect {:#x} {callee}: {reason}\n",
+                                    at.get_offset()
+                                )
+                            })
+                    }))
+                    .chain(format_checks.iter().filter(|(at, format, value)| {
+                        !crate::kuna_constformat::holds(&fd, at, format, *value)
+                    }).map(|(at, format, value)| {
+                        format!(
+                            "Rejected {}: {}\n",
+                            crate::kuna_constformat::console_line(at.get_offset(), format, *value),
+                            crate::kuna_constformat::NOT_REPLAYED
+                        )
+                    }))
                     .collect();
                 dcp.printed_checks = (!expected.is_empty()).then_some((check_lines, expected));
                 dcp.fd = Some(fd);
+                dcp.stopped_flow = None;
                 for line in &refusals {
                     status.out(line);
                 }
@@ -2551,6 +2677,7 @@ decomp_command!(
         // size) and write it to the bulk stream, mirroring `print C`.
         let raw = {
             let dcp = dcp_mut(status)?;
+            dcp.follow_stopped_flow();
             if dcp.fd.is_none() {
                 return Err(IfaceError::execution("No function selected"));
             }
@@ -2859,13 +2986,14 @@ decomp_command!(
             return Err(IfaceError::parse("Missing new name"));
         }
         let dcp = dcp_mut(status)?;
-        let maxduplicates = if dcp.conf.as_ref().is_some_and(|p| p.arch().dynamic_hash_maxdup_high) { 16 } else { 8 };
+        let maxduplicates = kuna_decomp::kuna_dynamichashmax::MAX_DUPLICATES;
         dcp.local_symbol_fd(&oldname)?;
         let (Some(fd), arch) = (dcp.fd.as_mut(), dcp.conf.as_ref().map(|p| p.arch())) else {
             return Err(IfaceError::execution("no function selected"));
         };
         let symbol = crate::kuna_hightarget::apply_local(fd, &oldname, &newname, None, maxduplicates, arch)
             .map_err(IfaceError::execution)?;
+        dcp.remember_local_edit();
         if let Some(symbol) = symbol {
             dcp.pending_local_checks.push((format!("rename {oldname} {newname}"), symbol, None));
         }
@@ -2915,13 +3043,14 @@ decomp_command!(
             (ct, newname, typetext)
         };
         let dcp = dcp_mut(status)?;
-        let maxduplicates = if dcp.conf.as_ref().is_some_and(|p| p.arch().dynamic_hash_maxdup_high) { 16 } else { 8 };
+        let maxduplicates = kuna_decomp::kuna_dynamichashmax::MAX_DUPLICATES;
         dcp.local_symbol_fd(&name)?;
         let (Some(fd), arch) = (dcp.fd.as_mut(), dcp.conf.as_ref().map(|p| p.arch())) else {
             return Err(IfaceError::execution("no function selected"));
         };
         let symbol = crate::kuna_hightarget::apply_local(fd, &name, &newname, Some(ct.clone()), maxduplicates, arch)
             .map_err(IfaceError::execution)?;
+        dcp.remember_local_edit();
         if let Some(symbol) = symbol {
             dcp.pending_local_checks.push((format!("retype {name} {}", typetext.trim()), symbol, Some(ct)));
         }
@@ -2930,16 +3059,24 @@ decomp_command!(
 );
 
 decomp_command!(
-    /// C++ `IfcIsolate`: `isolate <name>`.
+    /// C++ `IfcIsolate`: `isolate <name>` (ifacedecomp.cc:1423), resolved as
+    /// `IfcRename` resolves its name (`crate::kuna_hightarget::isolate_local`).
     IfcIsolate,
     fn execute(&self, status: &mut IfaceStatus, s: &mut CommandStream) -> IfaceResult<()> {
-        let _dcp = dcp_mut(status)?;
         s.skip_ws();
         let symbol_name = s.read_token();
         if symbol_name.is_empty() {
             return Err(IfaceError::parse("Missing symbol name"));
         }
-        Err(engine_unavailable("IfaceDecompData::readSymbol + Symbol::setIsolated"))
+        let dcp = dcp_mut(status)?;
+        let maxduplicates = kuna_decomp::kuna_dynamichashmax::MAX_DUPLICATES;
+        dcp.local_symbol_fd(&symbol_name)?;
+        let (Some(fd), arch) = (dcp.fd.as_mut(), dcp.conf.as_ref().map(|p| p.arch())) else {
+            return Err(IfaceError::execution("no function selected"));
+        };
+        crate::kuna_hightarget::isolate_local(fd, &symbol_name, maxduplicates, arch)
+            .map_err(IfaceError::execution)?;
+        Ok(())
     }
 );
 
@@ -3086,10 +3223,10 @@ decomp_command!(
             .ok_or_else(|| IfaceError::execution("No load image present"))?;
         // C++: Varnode *vn = dcp->readVarnode(s) — parse + resolve the varnode.
         let (loc, defsize, pc, uq) = parse_varnode(prog, s).map_err(IfaceError::parse)?;
-        // The DynamicHash collision budget (glb->dynamic_hash_maxdup_high) and the
-        // EquateSymbol's getBase(1,TYPE_UNKNOWN) type are the two merged-tree boundaries
-        // build_dynamic_symbol takes as parameters; resolve both from the arch.
-        let maxduplicates: u32 = if prog.arch().dynamic_hash_maxdup_high { 16 } else { 8 };
+        // The DynamicHash collision budget and the EquateSymbol's
+        // getBase(1,TYPE_UNKNOWN) type are the two merged-tree boundaries
+        // build_dynamic_symbol takes as parameters.
+        let maxduplicates: u32 = kuna_decomp::kuna_dynamichashmax::MAX_DUPLICATES;
         let base1 = prog
             .arch()
             .types()
@@ -3140,6 +3277,38 @@ decomp_command!(
             .ok_or_else(|| IfaceError::execution("Function has no local scope"))?;
         scope_local.set_display_format(sym, format);
         scope_local.set_attribute(sym, varnode_flags::typelock);
+        status.out("Successfully forced format display\n");
+        Ok(())
+    }
+);
+
+decomp_command!(
+    /// (kuna) `force constant <addr> <format> [<value>]`: `force varnode` for
+    /// the constant the instruction at `addr` reads, named without a p-code
+    /// sequence number (`crate::kuna_constformat`).
+    IfcForceConstant,
+    fn execute(&self, status: &mut IfaceStatus, s: &mut CommandStream) -> IfaceResult<()> {
+        if dcp_mut(status)?.fd.is_none() {
+            return Err(IfaceError::execution("No function selected"));
+        }
+        let dcp = dcp_mut(status)?;
+        let prog = dcp.conf.as_ref().ok_or_else(|| IfaceError::execution("No load image present"))?;
+        let (addr, _size) = parse_input_code_address(prog, s).map_err(IfaceError::parse)?;
+        s.skip_ws();
+        let format = s.read_token();
+        s.skip_ws();
+        let value = match s.read_token().as_str() {
+            "" => None,
+            token => Some(
+                crate::kuna_constformat::parse_value(token)
+                    .ok_or_else(|| IfaceError::parse("Bad constant value"))?,
+            ),
+        };
+        let maxduplicates = kuna_decomp::kuna_dynamichashmax::MAX_DUPLICATES;
+        let fd = dcp.fd.as_mut().expect("fd checked Some above");
+        crate::kuna_constformat::apply(fd, prog.arch(), &addr, &format, value, maxduplicates)
+            .map_err(IfaceError::execution)?;
+        dcp.pending_format_checks.push((addr, format, value));
         status.out("Successfully forced format display\n");
         Ok(())
     }
@@ -3253,26 +3422,13 @@ decomp_command!(
         let prog = dcp.conf.as_ref().expect("conf present when fd present");
         let (callpoint, _size) = parse_machaddr(prog, s, false).map_err(IfaceError::parse)?;
         let fd = dcp.fd.as_ref().expect("fd present");
-        let mut found = false;
-        for i in 0..fd.num_calls() {
-            let op = fd.get_call_specs(i).get_op();
-            if let Some(o) = fd.obank().get(op) {
-                if o.get_addr() == &callpoint {
-                    found = true;
-                    break;
-                }
-            }
-        }
-        if !found {
-            return Err(IfaceError::execution("No call is made at this address"));
+        if !crate::kuna_callproto::has_call_at(fd, &callpoint) {
+            return Err(IfaceError::execution(crate::kuna_callproto::NO_CALL));
         }
         // C++ parse_protopieces(pieces,s,dcp->conf) — the remainder of the line.
         s.skip_ws();
         let decl = s.rest().trim().to_string();
-        let (addr_size, word_size) = prog.arch().data_org();
-        let org = crate::grammar::DataOrg { addr_size, word_size };
-        let pieces = crate::grammar::parse_protopieces(&decl, prog.arch().types(), org)
-            .map_err(|e| IfaceError::execution(e.explain().to_string()))?;
+        let pieces = crate::kuna_callproto::parse(prog, &decl).map_err(IfaceError::execution)?;
         // C++ builds a FuncProto (setInternal + setPieces) and
         // insertProtoOverride(callpoint, newproto).  The W4 `applyPrototype` consume
         // (FlowInfo::queryCall) is still stubbed (LOSS-031 neighborhood), so the
@@ -3376,6 +3532,35 @@ decomp_command!(
                 crate::kuna_retcallchain::kuna_render_sites(&chained)
             ));
         }
+        Ok(())
+    }
+);
+
+decomp_command!(
+    /// (kuna) `override indirect <callsite> <name|address>`: the indirect call
+    /// at `<callsite>` goes to that function ([`crate::kuna_calleeoverride`]).
+    /// Not a C++ command, so [`crate::kuna_console::register_kuna_commands`]
+    /// registers it.
+    IfcOverrideIndirect,
+    fn execute(&self, status: &mut IfaceStatus, s: &mut CommandStream) -> IfaceResult<()> {
+        let dcp = dcp_mut(status)?;
+        let Some(fd) = dcp.fd.as_ref() else {
+            return Err(IfaceError::execution("No function selected"));
+        };
+        let entry = fd.get_address().clone();
+        let fname = fd.get_name().to_string();
+        let prog = dcp.conf.as_mut().expect("conf present when fd present");
+        let (site, _size) = parse_input_code_address(prog, s).map_err(IfaceError::parse)?;
+        s.skip_ws();
+        let callee = s.read_token();
+        if callee.is_empty() {
+            return Err(IfaceError::parse("Missing callee"));
+        }
+        crate::kuna_calleeoverride::plant(prog, &entry, &site, &callee)
+            .map_err(IfaceError::execution)?;
+        prog.callwide_unavailable("indirect-call override requires a new complete image proof");
+        dcp.pending_callee_overrides.entry(fname).or_default().push((site, callee));
+        status.out("Successfully added override\n");
         Ok(())
     }
 );
@@ -4188,6 +4373,7 @@ pub fn register_decomp_commands(status: &mut IfaceStatus) {
     status.register_com(Box::new(IfcDumpbinary), &["binary"]);
     status.register_com(Box::new(IfcForcegoto), &["force", "goto"]);
     status.register_com(Box::new(IfcForceFormat), &["force", "varnode"]);
+    status.register_com(Box::new(IfcForceConstant), &["force", "constant"]);
     status.register_com(Box::new(IfcForceDatatypeFormat), &["force", "datatype"]);
     status.register_com(Box::new(IfcProtooverride), &["override", "prototype"]);
     status.register_com(Box::new(IfcJumpOverride), &["override", "jumptable"]);
@@ -4304,8 +4490,15 @@ pub fn register_console_commands(status: &mut IfaceStatus) {
 /// lands and real `KunaError`s flow out of the command bodies; the catch
 /// placement (which frame catches which) is preserved (ADR 0004).
 ///
+/// The command runs under the loaded program's load-time options.
+///
 /// Returns after writing the diagnostic and calling [`IfaceStatus::evaluate_error`].
 pub fn execute(status: &mut IfaceStatus) {
+    let _load = status
+        .get_data(DECOMPILE_MODULE)
+        .and_then(|data| data.as_any().downcast_ref::<IfaceDecompData>())
+        .and_then(|dcp| dcp.conf.as_ref())
+        .map(|prog| prog.arch().load_scope());
     match status.run_command() {
         Ok(_) => return,
         Err(err) => {

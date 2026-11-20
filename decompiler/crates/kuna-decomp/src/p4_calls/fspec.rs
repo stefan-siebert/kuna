@@ -201,6 +201,8 @@ pub enum Containment {
 /// is non-null when this entry is a logical variable built from joined pieces.
 #[derive(Debug, Clone)]
 pub struct ParamEntry {
+    /// A declared extension beyond the logical parameter slot.
+    pub(crate) register_extension: Option<crate::p4_calls::kuna_registerslots::Extension>,
     /// Boolean properties of the parameter (C++ `flags`).
     flags: uint4,
     /// Data-type storage class that this entry must match (C++ `type`).
@@ -232,6 +234,7 @@ impl ParamEntry {
     /// in by `decode`.
     pub fn new(grp: int4) -> ParamEntry {
         ParamEntry {
+            register_extension: None,
             flags: 0,
             type_: type_class::TYPECLASS_GENERAL,
             group_set: vec![grp],
@@ -1128,6 +1131,11 @@ impl ParamTrial {
     pub fn is_ind_create_formed(&self) -> bool {
         (self.flags & param_trial_flags::INDCREATE_FORMED) != 0
     }
+    /// (kuna) Take a trial formed by indirect creation as a value of its own:
+    /// the half of a callee's proven pair the function hands back.
+    pub fn clear_ind_create_formed(&mut self) {
+        self.flags &= !param_trial_flags::INDCREATE_FORMED;
+    }
     /// Mark this trial as possibly affected by conditional execution (C++
     /// `setCondExeEffect`).
     pub fn set_cond_exe_effect(&mut self) {
@@ -1323,6 +1331,10 @@ pub struct ParamActive {
     /// SITE's argument list when the next slot is on the stack?  Set by
     /// `ActionActiveParam`; see [`crate::p4_calls::kuna_stackarggap`].
     stack_arg_gap: bool,
+    /// (kuna `calleereginputs`) Does the callee read every register parameter
+    /// of the model these trials are scored against?  Set by
+    /// `ActionActiveParam`; see [`crate::p4_calls::kuna_calleereginputs`].
+    callee_reads_registers: bool,
     /// (kuna) `condexeret`: where the output trials stand with respect to the one
     /// retry pass; see [`crate::p4_calls::kuna_condexeret`].
     cond_exe_retry: crate::p4_calls::kuna_condexeret::CondExeRetry,
@@ -1351,6 +1363,7 @@ impl ParamActive {
             vararg_stack_split: false, // (kuna) varargstackargs
             own_input_gap: false,      // (kuna) inputparamgap
             stack_arg_gap: false,      // (kuna) stackarggap
+            callee_reads_registers: false, // (kuna) calleereginputs
             cond_exe_retry: Default::default(), // (kuna) condexeret
             single_floats: Vec::new(), // (kuna) armfloatargs
             read_singles: Vec::new(),  // (kuna) armfloatargs
@@ -1495,6 +1508,18 @@ impl ParamActive {
     /// property of the call, not of one pass.
     pub fn set_stack_arg_gap(&mut self, val: bool) {
         self.stack_arg_gap = val;
+    }
+
+    /// (kuna `calleereginputs`) Does the callee read every register parameter
+    /// of the model?
+    pub fn is_callee_reads_registers(&self) -> bool {
+        self.callee_reads_registers
+    }
+
+    /// (kuna `calleereginputs`) Record whether the callee reads every register
+    /// parameter of the model; a property of the call, kept across `clear()`.
+    pub fn set_callee_reads_registers(&mut self, val: bool) {
+        self.callee_reads_registers = val;
     }
 
     /// (kuna) `armfloatargs`: record the callee's stated single-precision inputs.
@@ -2488,6 +2513,9 @@ impl ParamListStandard {
     /// Get the type of extension and containing parameter for the given storage
     /// (C++ `assumedExtension`).
     pub fn assumed_extension(&self, addr: &Address, size: int4, res: &mut VarnodeData) -> OpCode {
+        if let Some(opcode) = super::kuna_registerslots::assumed(&self.entry, addr, size, res) {
+            return opcode;
+        }
         for e in self.entry.iter() {
             if e.get_min_size() > size {
                 continue;
@@ -3049,6 +3077,42 @@ impl ParamListStandard {
         Ok(())
     }
 
+    /// (kuna `calleereginputs`) Every register parameter the callee reads is an
+    /// argument: its trial is active, a register the caller never wrote included
+    /// (the callee receives the caller's own value). See
+    /// [`crate::p4_calls::kuna_calleereginputs`].
+    fn activate_register_entries(&self, active: &mut ParamActive, manager: &AddrSpaceManager) -> KunaResult<()> {
+        let mut added = false;
+        for (eidx, e) in self.entry.iter().enumerate() {
+            if e.get_space().get_type() != spacetype::IPTR_PROCESSOR {
+                continue;
+            }
+            match (0..active.get_num_trials()).find(|&i| active.get_trial(i).get_entry() == Some(eidx)) {
+                Some(i) => {
+                    if active.get_trial(i).is_unref() {
+                        active.get_trial_mut(i).mark_active();
+                    }
+                }
+                None => {
+                    let sz = if e.is_exclusion() { e.get_size() } else { e.get_align() };
+                    let mut nextslot = 0;
+                    let addr = e.get_addr_by_slot(&mut nextslot, sz, 1, manager)?;
+                    let trialpos = active.get_num_trials();
+                    active.register_trial(&addr, sz);
+                    let pt = active.get_trial_mut(trialpos);
+                    pt.mark_unref();
+                    pt.set_entry(Some(eidx), 0);
+                    pt.mark_active();
+                    added = true;
+                }
+            }
+        }
+        if added {
+            active.sort_trials(&self.entry);
+        }
+        Ok(())
+    }
+
     /// Calculate the range of trials in each resource section (C++
     /// `separateSections`).
     fn separate_sections(&self, active: &ParamActive, trial_start: &mut Vec<int4>) -> KunaResult<()> {
@@ -3356,6 +3420,9 @@ impl ParamListStandard {
             ));
         }
         self.build_trial_map(active, manager)?;
+        if active.is_callee_reads_registers() {
+            self.activate_register_entries(active, manager)?;
+        }
         self.force_exclusion_group(active);
         let mut trial_start: Vec<int4> = Vec::new();
         self.separate_sections(active, &mut trial_start)?;
@@ -3918,10 +3985,6 @@ pub struct ProtoModel {
     localrange: RangeList,
     /// Memory range(s) of space-based parameters (C++ `paramrange`).
     paramrange: RangeList,
-    /// (kuna `protoranges`) `defaultLocalRange`, kept beside a spec's own.
-    default_localrange: RangeList,
-    /// (kuna `protoranges`) `defaultParamRange`, kept beside a spec's own.
-    default_paramrange: RangeList,
     /// `true` if stack parameters have low->high address ordering (C++
     /// `stackgrowsnegative`).
     stackgrowsnegative: bool,
@@ -3991,8 +4054,6 @@ impl ProtoModel {
             inject_upon_return: -1,
             localrange: RangeList::new(),
             paramrange: RangeList::new(),
-            default_localrange: RangeList::new(),
-            default_paramrange: RangeList::new(),
             stackgrowsnegative: true, // Normal stack parameter ordering
             has_this: false,
             is_construct: false,
@@ -4002,8 +4063,6 @@ impl ProtoModel {
         };
         res.default_local_range(manager);
         res.default_param_range(manager);
-        res.default_localrange = res.localrange.clone();
-        res.default_paramrange = res.paramrange.clone();
         res
     }
 
@@ -4067,24 +4126,6 @@ impl ProtoModel {
     /// Get the range of (possible) stack parameters (C++ `getParamRange`).
     pub fn get_param_range(&self) -> &RangeList {
         &self.paramrange
-    }
-    /// The local range `protoranges` selects: the spec's when `spec`, else the
-    /// default.
-    pub fn local_range(&self, spec: bool) -> &RangeList {
-        if spec {
-            &self.localrange
-        } else {
-            &self.default_localrange
-        }
-    }
-    /// The parameter range `protoranges` selects: the spec's when `spec`, else
-    /// the default.
-    pub fn param_range(&self, spec: bool) -> &RangeList {
-        if spec {
-            &self.paramrange
-        } else {
-            &self.default_paramrange
-        }
     }
     /// Replace the default local range with the decoded one (C++ `decode`'s
     /// `localrange` arm).
@@ -4171,6 +4212,30 @@ impl ProtoModel {
     /// (kuna) The input resource model, or `None` before `build_param_list`.
     pub fn input_opt(&self) -> Option<&ParamListStandard> {
         self.input.as_ref()
+    }
+
+    /// Restrict a convention with one forward stack resource to a whole-slot frame area.
+    pub fn kuna_bound_stack_inputs(&self, bytes: u32) -> Option<Self> {
+        let input = self.input_opt()?;
+        let [entry] = input.entry.as_slice() else { return None };
+        let bytes = i32::try_from(bytes).ok()?;
+        if entry.get_space().get_type() != spacetype::IPTR_SPACEBASE
+            || entry.is_reverse_stack()
+            || entry.alignment <= 0
+            || bytes <= 0
+            || bytes > entry.size
+            || bytes % entry.alignment != 0
+        {
+            return None;
+        }
+        let mut model = self.clone();
+        let input = model.input_mut();
+        let entry = &mut input.entry[0];
+        entry.size = bytes;
+        entry.minsize = entry.alignment;
+        entry.numslots = bytes / entry.alignment;
+        input.populate_resolver();
+        Some(model)
     }
     /// Borrow the output resource model (panics if not yet built — C++ would
     /// dereference a null `output`).
@@ -4624,8 +4689,6 @@ impl ProtoModel {
             self.likelytrash = model.likelytrash.clone();
             self.localrange = model.localrange.clone();
             self.paramrange = model.paramrange.clone();
-            self.default_localrange = model.default_localrange.clone();
-            self.default_paramrange = model.default_paramrange.clone();
         } else {
             self.input.as_mut().unwrap().fold_in(model.input())?;
             // We assume here that the output models are the same, but we don't check
@@ -4649,14 +4712,6 @@ impl ProtoModel {
             }
             for r in model.paramrange.iter() {
                 self.paramrange
-                    .insert_range(Rc::clone(r.get_space()), r.get_first(), r.get_last());
-            }
-            for r in model.default_localrange.iter() {
-                self.default_localrange
-                    .insert_range(Rc::clone(r.get_space()), r.get_first(), r.get_last());
-            }
-            for r in model.default_paramrange.iter() {
-                self.default_paramrange
                     .insert_range(Rc::clone(r.get_space()), r.get_first(), r.get_last());
             }
         }
@@ -6002,12 +6057,21 @@ impl FuncProto {
         // unconditionally, so those pieces aborted the process the moment the
         // function was decompiled. The declared type IS the return type — adopt it
         // and the model has something to assign against, after which `set_pieces`
-        // replaces the derived storage with the explicit one as before.
+        // replaces the derived storage with the explicit one as before. With
+        // no stated inputs, leave input recovery open on the rebuilt callee.
         if pieces.outtype.is_none() {
             if let Some(declared) = pieces.output_storage.as_ref().and_then(|p| p.type_.clone()) {
                 let mut typed = pieces.clone();
                 typed.outtype = Some(declared);
-                return self.set_pieces(&typed, Some(defaultfp), typefactory, manager);
+                self.set_pieces(&typed, Some(defaultfp), typefactory, manager)?;
+                if pieces.intypes.is_empty()
+                    && pieces.innames.is_empty()
+                    && pieces.input_storage.is_empty()
+                    && pieces.first_var_arg_slot < 0
+                {
+                    self.set_input_lock(false);
+                }
+                return Ok(());
             }
         }
         self.set_pieces(pieces, Some(defaultfp), typefactory, manager)
@@ -6479,14 +6543,6 @@ impl FuncProto {
     pub fn get_param_range(&self) -> &RangeList {
         self.model().get_param_range()
     }
-    /// The local range `protoranges` selects (see [`ProtoModel::local_range`]).
-    pub fn local_range(&self, spec: bool) -> &RangeList {
-        self.model().local_range(spec)
-    }
-    /// The parameter range `protoranges` selects (see [`ProtoModel::param_range`]).
-    pub fn param_range(&self, spec: bool) -> &RangeList {
-        self.model().param_range(spec)
-    }
     /// Return true if the stack grows toward smaller addresses (C++
     /// `isStackGrowsNegative`).
     pub fn is_stack_grows_negative(&self) -> bool {
@@ -6844,6 +6900,29 @@ pub struct FuncCallSpecs {
     /// (kuna `pltlocal`) The PLT stub a call through it was built past, at the
     /// definition the stub is bound to. See [`crate::p4_calls::kuna_pltlocal`].
     plt_stub: Option<Address>,
+    /// (kuna) The model the direct callee's register inputs select. See
+    /// [`crate::p4_calls::kuna_calleereginputs`].
+    callee_reg_model: Option<Rc<ProtoModel>>,
+    /// (kuna) How many of EAX, ECX and EDX the direct callee reads before
+    /// writing them. See [`crate::p4_calls::kuna_calleereginputs`].
+    callee_arg_registers: u8,
+    /// (kuna) The extrapop the direct callee's own returns state. See
+    /// [`crate::p4_calls::kuna_calleepurge`].
+    callee_purge: Option<int4>,
+    /// (kuna `calleeargs`) The stack-argument bytes the direct callee reads. See
+    /// [`crate::p4_calls::kuna_calleestackargs`].
+    callee_stack_arg_bytes: Option<crate::p4_calls::kuna_calleepurge::StackArgs>,
+    /// (kuna `calleeargs`) The direct callee moves its caller's stack pointer.
+    callee_moves_stack: bool,
+    /// (kuna `calleeargs`) For a direct callee with no stated extent, the stack
+    /// bytes its returns pop or the caller removes after the call.
+    callee_stack_window: Option<u32>,
+    /// (kuna `calleeargs`) For a direct callee with no stated extent, the stack
+    /// bytes its own reached returns pop above the return address.
+    callee_return_pop: Option<u32>,
+    /// (kuna `calleereginputs`) The stack bytes the caller removes right after
+    /// this indirect call. See [`crate::p4_calls::kuna_calleereginputs`].
+    callind_cleanup: u32,
 }
 
 impl FuncCallSpecs {
@@ -6880,6 +6959,14 @@ impl FuncCallSpecs {
             format_arity: None,              // (kuna) formatstring
             jump_target_storage: None,       // (kuna) tailcalljump
             plt_stub: None,                  // (kuna) pltlocal
+            callee_reg_model: None,
+            callee_arg_registers: 0,
+            callee_purge: None,
+            callee_stack_arg_bytes: None,
+            callee_moves_stack: false,
+            callee_stack_window: None,
+            callee_return_pop: None,
+            callind_cleanup: 0,
         }
     }
 
@@ -6912,6 +6999,14 @@ impl FuncCallSpecs {
         res.format_arity = self.format_arity;
         res.jump_target_storage = self.jump_target_storage.clone();
         res.plt_stub = self.plt_stub.clone();
+        res.callee_reg_model = self.callee_reg_model.clone();
+        res.callee_arg_registers = self.callee_arg_registers;
+        res.callee_purge = self.callee_purge;
+        res.callee_stack_arg_bytes = self.callee_stack_arg_bytes;
+        res.callee_moves_stack = self.callee_moves_stack;
+        res.callee_stack_window = self.callee_stack_window;
+        res.callee_return_pop = self.callee_return_pop;
+        res.callind_cleanup = self.callind_cleanup;
         res
     }
 
@@ -7268,6 +7363,91 @@ impl FuncCallSpecs {
         self.plt_stub = Some(stub);
     }
 
+    /// The model the direct callee's register inputs select, if read.
+    pub fn callee_reg_model(&self) -> Option<&Rc<ProtoModel>> {
+        self.callee_reg_model.as_ref()
+    }
+
+    /// Record the model the direct callee's register inputs select.
+    pub fn set_callee_reg_model(&mut self, model: Option<Rc<ProtoModel>>) {
+        self.callee_reg_model = model;
+    }
+
+    /// How many of EAX, ECX and EDX the direct callee reads before writing them.
+    pub fn callee_arg_registers(&self) -> u8 {
+        self.callee_arg_registers
+    }
+
+    /// Record how many of EAX, ECX and EDX the direct callee reads before
+    /// writing them.
+    pub fn set_callee_arg_registers(&mut self, count: u8) {
+        self.callee_arg_registers = count;
+    }
+
+    /// The extrapop the direct callee's own returns state, if read.
+    pub fn callee_purge(&self) -> Option<int4> {
+        self.callee_purge
+    }
+
+    /// Record the extrapop the direct callee's own returns state.
+    pub fn set_callee_purge(&mut self, extrapop: Option<int4>) {
+        self.callee_purge = extrapop;
+    }
+
+    /// The stack-argument bytes the direct callee reads, if measured.
+    pub fn callee_stack_arg_bytes(&self) -> Option<crate::p4_calls::kuna_calleepurge::StackArgs> {
+        self.callee_stack_arg_bytes
+    }
+
+    /// Record the stack-argument bytes the direct callee reads.
+    pub fn set_callee_stack_arg_bytes(&mut self, bytes: Option<crate::p4_calls::kuna_calleepurge::StackArgs>) {
+        self.callee_stack_arg_bytes = bytes;
+    }
+
+    /// Does the direct callee move its caller's stack pointer?
+    pub fn callee_moves_stack(&self) -> bool {
+        self.callee_moves_stack
+    }
+
+    /// Record whether the direct callee moves its caller's stack pointer.
+    pub fn set_callee_moves_stack(&mut self, moves: bool) {
+        self.callee_moves_stack = moves;
+    }
+
+    /// The stack bytes a direct callee with no stated extent pops or the caller
+    /// removes after the call, if known.
+    pub fn callee_stack_window(&self) -> Option<u32> {
+        self.callee_stack_window
+    }
+
+    /// Record the stack bytes a direct callee with no stated extent pops or the
+    /// caller removes after the call.
+    pub fn set_callee_stack_window(&mut self, window: Option<u32>) {
+        self.callee_stack_window = window;
+    }
+
+    /// The stack bytes the reached returns of a direct callee with no stated
+    /// extent pop above the return address (`ret 0x20`), if any is reached.
+    pub fn callee_return_pop(&self) -> Option<u32> {
+        self.callee_return_pop
+    }
+
+    /// Record what the reached returns of a direct callee with no stated
+    /// extent pop above the return address.
+    pub fn set_callee_return_pop(&mut self, pop: Option<u32>) {
+        self.callee_return_pop = pop;
+    }
+
+    /// The stack bytes the caller removes right after this indirect call.
+    pub fn callind_cleanup(&self) -> u32 {
+        self.callind_cleanup
+    }
+
+    /// Record the stack bytes the caller removes right after this indirect call.
+    pub fn set_callind_cleanup(&mut self, bytes: u32) {
+        self.callind_cleanup = bytes;
+    }
+
     /// (kuna `tailcalljump`) Record the register that carried this tail call's
     /// computed target.  See [`Self::carries_jump_target`].
     pub fn set_jump_target_storage(&mut self, storage: (Address, int4)) {
@@ -7406,6 +7586,9 @@ impl FuncCallSpecs {
         newinput: &mut Vec<Option<VarnodeId>>,
         newoutput: &mut Vec<VarnodeId>,
     ) -> KunaResult<bool> {
+        if super::kuna_joincalloutput::needs_reflow(data, self, restricted_proto) {
+            return Ok(false);
+        }
         if data.get_arch().call_mechanism_effects
             && crate::kuna_callmechanisms::requires_reflow(&self.proto, restricted_proto)
         {

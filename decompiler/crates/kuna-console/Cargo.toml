@@ -49,6 +49,10 @@ name = "integration"
 path = "tests/integration.rs"
 
 [[test]]
+name = "verify_budget_stop"
+path = "tests/verify_budget_stop.rs"
+
+[[test]]
 name = "verify_dwarfstructs"
 path = "tests/verify_dwarfstructs.rs"
 
@@ -65,6 +69,10 @@ name = "verify_fid"
 path = "tests/verify_fid.rs"
 
 [[test]]
+name = "verify_flirt_sites"
+path = "tests/verify_flirt_sites.rs"
+
+[[test]]
 name = "verify_libctypes_glibc_target"
 path = "tests/verify_libctypes_glibc_target.rs"
 
@@ -77,16 +85,16 @@ name = "verify_msvcfpconst"
 path = "tests/verify_msvcfpconst.rs"
 
 [[test]]
+name = "verify_loadoptions"
+path = "tests/verify_loadoptions.rs"
+
+[[test]]
 name = "verify_pdatachained"
 path = "tests/verify_pdatachained.rs"
 
 [[test]]
 name = "verify_pdb"
 path = "tests/verify_pdb.rs"
-
-[[test]]
-name = "verify_relocrebase_gate"
-path = "tests/verify_relocrebase_gate.rs"
 
 [[test]]
 name = "verify_rexthunk"

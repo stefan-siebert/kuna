@@ -5,7 +5,9 @@
 
 pub mod funcdata_callsite;
 pub mod fspec;
+pub(crate) mod kuna_joincalloutput;
 pub mod modelrules;
+mod kuna_aggregateabi;
 pub mod coreaction_protos;
 pub mod kuna_calleedeadarg;
 pub mod kuna_hiddenretarg; // (kuna) a value left in the hidden-return register is no argument a callee cannot take
@@ -14,6 +16,12 @@ pub mod kuna_zerofillreturn; // (kuna) the zero a narrow write leaves in a retur
 pub mod kuna_zerocallregs; // (kuna) a register a -fzero-call-used-regs epilogue clears is no part of the return value
 pub mod kuna_calleepreserves; // (kuna) the decoded callee's writes narrow the cspec killedbycall set
 pub mod kuna_callretpair; // (kuna) complete the two-register CALL output arm on any image, not just a Rust one
+pub mod kuna_x87intrinsic; // (kuna) the MSVC x87 one-operand intrinsics' ST0 model
+pub mod kuna_calleereginputs; // (kuna) an x86-32 callee's register inputs choose its model
+pub mod kuna_calleestackargs; // (kuna `calleeargs`) the stack-argument bytes an x86-32 callee reads
+pub mod kuna_calleepurge; // (kuna) an x86-32 callee's stack purge read off its RET
+pub mod kuna_stackcookie; // (kuna) the frame cookie MSVC stores on the stack is no argument
+pub mod kuna_slotargs; // (kuna) a call through an import slot takes the declared parameters its caller's writes back
 pub mod kuna_calleeprotostack; // (kuna) a declared callee's prototype states its stack contract
 pub mod kuna_msvcbyval; // (kuna) an MSVC __cdecl import's by-value class argument sized at the call site
 pub(crate) mod kuna_calleenoreturn;
@@ -22,6 +30,8 @@ pub mod kuna_calleescratchbody; // (kuna) a scratch-only clobberer is still a bo
 pub mod kuna_callsitestackargs;
 pub mod kuna_dfunaffected;
 pub mod kuna_exclusivearguse; // (kuna) a dereference on the other arm of a branch does not compete with a call on this one
+pub mod kuna_exclusivecallret; // (kuna) a call and a return on mutually exclusive arms do not compete
+pub mod kuna_sharedpush; // (kuna) a push above a branch is the argument of the call on each arm
 pub mod kuna_noreturnretuse;
 pub mod kuna_returnpair;
 pub mod kuna_retinputhalf;
@@ -29,6 +39,7 @@ pub mod kuna_retcallhalf; // (kuna) a call's result handed back beside a compute
 pub mod kuna_retsysreg; // (kuna) a register set for a system register is not the high word of the return
 pub mod kuna_retpushedhalf;
 pub mod kuna_reloadarg; // (kuna) a register reloaded from the caller's frame is re-scored once the frame is heritaged
+pub mod kuna_directalias; // (kuna) a direct access at a known stack offset aliases only the bytes it touches
 pub mod kuna_returnuncomputed;
 pub mod kuna_spillargtrial;
 pub mod kuna_stackaddrargtrial;
@@ -49,6 +60,7 @@ pub mod kuna_formatwitness; // (kuna) equal constant formats can witness a parti
 pub mod kuna_inputparamgap; // (kuna) an unused-argument-register run must not veto a later live-in
 pub mod kuna_stackarggap; // (kuna) an unwritten argument register ends a call site's argument list
 pub mod kuna_gobool; // (kuna) Go boolean-return stale-high narrowing (docs/multilang.md W4)
+pub mod kuna_gochanrecv;
 pub mod kuna_rustabi; // (kuna) the rustc two-register return: keep the pair, connect it at the call
 pub mod kuna_langabi; // (kuna) the ABI seam: per-language `extern` rendering
 pub mod kuna_formattail; // (kuna) a resolved format call keeps an open tail through trial scoring
@@ -80,14 +92,19 @@ pub mod kuna_voidret; // (kuna) a function whose result a caller reads returns i
 pub mod kuna_callerreads; // (kuna) a function decompiled alone returns what its callers read
 pub mod kuna_callwide;
 pub mod kuna_bejoin; // (kuna) a big-endian pair joins its halves in the ABI's order when its low word is returned on purpose
+pub mod kuna_bejoinpass; // (kuna) a big-endian pair a call hands back to the RETURN untouched is one value
 
 pub(crate) mod kuna_customreturn;
 pub(crate) mod kuna_stackparamalign;
 pub mod kuna_x87emptyreturn;
 pub(crate) mod kuna_inputstorage;
+pub mod kuna_inputhints; // (kuna) unlocked names and types for recovered inputs
+pub mod kuna_swiftcall; // (kuna) Swift calls that may throw, and stale swiftself arguments
 pub mod kuna_floatregister;
 pub mod kuna_x87free;
 
 pub mod kuna_callmechanisms;
+pub(crate) mod kuna_registerslots;
 
 pub mod kuna_qualifiedcall;
+pub mod kuna_gotimportproto; // (kuna) a type-only declaration binds at a loader-proven MIPS GOT import call

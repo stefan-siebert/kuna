@@ -6,21 +6,27 @@
 
 pub mod addrtable;
 pub mod aif;
+pub mod blobs;
 pub mod callfixup;
 pub mod demangle;
 pub mod dwarf;
+pub mod kuna_cvftrace;
 pub mod entry;
 pub mod fid;
+pub mod flirt;
 pub mod fast_funcdisc;
 pub mod formatstring;
 pub mod noreturn_disc;
 pub mod noreturn_propagate;
+pub mod cfstring;
 pub mod objc;
 pub mod operand_refs;
 pub mod gotypes;
+pub mod kernelbug;
 pub mod pclntab;
 pub mod pdb;
 pub mod protos;
 pub mod rtti;
 pub mod sourcelang;
 pub mod strings;
+pub mod swift;

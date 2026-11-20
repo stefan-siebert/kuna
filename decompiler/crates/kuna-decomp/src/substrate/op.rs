@@ -222,6 +222,21 @@ pub mod pcodeop_addlflags {
     /// writes a narrowed call result back into its register.  Set and read by
     /// [`crate::p4_calls::kuna_narrowret`].
     pub const kuna_narrowret: uint4 = 0x400000;
+    /// (kuna) Heritage left this op's read of its own output storage empty
+    /// for renaming to fill, instead of linking a placeholder Varnode. Set and
+    /// cleared within one heritage pass by
+    /// [`crate::p3_dataflow::kuna_renamereads`].
+    pub const kuna_rename_read: uint4 = 0x800000;
+    /// Transient saved RBP in a summarized Rust callee, not a caller-reserved slot.
+    pub const kuna_rustprobe_spill: uint4 = 0x1000000;
+    /// (kuna `persistcalls`) This call guard of a persistent global is the one
+    /// a following read sees, on a range some earlier call was left unguarded
+    /// over. Set by `Heritage::guard_calls`; read by `RuleIndirectCollapse`.
+    pub const kuna_persist_guard: uint4 = 0x2000000;
+    /// (kuna `persistcalls`) This call guard of a persistent global reads the
+    /// value from before a call left unguarded. Set by `Heritage::guard_calls`;
+    /// a merge copy of its input or its collapse restarts the function.
+    pub const kuna_persist_stale: uint4 = 0x4000000;
 }
 
 // ---------------------------------------------------------------------------
@@ -1715,6 +1730,12 @@ impl PcodeOpBank {
         self.useroplist.clear();
     }
 
+    /// Take `n` sequence times without creating ops, so later ops are timed as
+    /// if they had been created.
+    pub fn reserve_uniq(&mut self, n: uintm) {
+        self.uniqid = self.uniqid.wadd(n);
+    }
+
     /// Create a PcodeOp with `inputs` empty input slots at the given Address;
     /// a fresh sequence number is assigned and the op is appended to the dead
     /// list (C++ `PcodeOpBank::create(int4,const Address&)`, `op.cc:971`).
@@ -1814,6 +1835,12 @@ impl PcodeOpBank {
         self.deadlist.erase(&mut self.arena, ListKind::Insert, op);
         // insert immediately after `prev`.
         self.deadlist.insert_after(&mut self.arena, ListKind::Insert, prev, op);
+    }
+
+    /// Insert a newly emitted raw operation before another raw operation.
+    pub fn insert_before_dead(&mut self, op: OpId, before: OpId) {
+        assert!(op != before && self.on_dead_list(op) && self.on_dead_list(before));
+        self.deadlist.splice_range(&mut self.arena, ListKind::Insert, op, op, Some(before));
     }
 
     /// Move the inclusive sequence `[firstop, lastop]` to right after `prev` in

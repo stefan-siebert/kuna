@@ -14,7 +14,7 @@ pub(crate) fn recover(
     arch: &Architecture,
     op: OpId,
 ) -> Option<(&'static str, String)> {
-    if !arch.rust_fmt_literal
+    if !arch.rust_fmt.recovers()
         || arch.source_lang() != crate::kuna_sourcelang::SourceLang::Rust
         || !matches!(arch.rustc_stable_version, Some((1, 93, 0 | 1)))
     {
@@ -25,8 +25,14 @@ pub(crate) fn recover(
         return None;
     }
     let stderr = print_sink(fd, op)?;
-    let ptr = constant_word(fd, call.get_in(1)?)?;
-    let tag = constant_word(fd, call.get_in(2)?)?;
+    let bytes = literal_bytes(fd, call.get_in(1)?, call.get_in(2)?)?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    Some(render(text, stderr))
+}
+
+pub(crate) fn literal_bytes(fd: &Funcdata, pointer: VarnodeId, descriptor: VarnodeId) -> Option<Vec<u8>> {
+    let ptr = constant_word(fd, pointer)?;
+    let tag = constant_word(fd, descriptor)?;
     let len = tag >> 1;
     if ptr == 0 || tag & 1 == 0 || len > 4096 || ptr.checked_add(len).is_none() {
         return None;
@@ -48,8 +54,7 @@ pub(crate) fn recover(
             .loader_fill(&mut bytes, &Address::new(Rc::clone(space), ptr))
             .ok()?;
     }
-    let text = std::str::from_utf8(&bytes).ok()?;
-    Some(render(text, stderr))
+    Some(bytes)
 }
 
 pub(crate) fn print_sink(fd: &Funcdata, id: OpId) -> Option<bool> {
@@ -96,7 +101,7 @@ fn constant_word(fd: &Funcdata, mut id: VarnodeId) -> Option<u64> {
     None
 }
 
-fn render(text: &str, stderr: bool) -> (&'static str, String) {
+pub(crate) fn render(text: &str, stderr: bool) -> (&'static str, String) {
     let (text, newline) = text.strip_suffix('\n').map_or((text, false), |s| (s, true));
     let name = match (stderr, newline) {
         (false, false) => "print!",

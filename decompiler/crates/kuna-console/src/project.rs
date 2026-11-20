@@ -38,6 +38,7 @@ use kuna_num::opcodes::OpCode;
 use kuna_sleigh::loadimage::section_flags;
 
 use crate::engine::{ConsoleProgram, EntryProvenance, FunctionEntry, ObjectLocation};
+pub use crate::kuna_stringoverlaps::GlobalAliasNames;
 
 /// `dat_` blocks larger than this are truncated in the `.asm` data tail (the
 /// printer's `dat_<hex>` names carry no size; the label only marks the start).
@@ -130,6 +131,10 @@ pub struct FuncResult {
     pub synth: Option<kuna_decomp::kuna_structsynth::shard::FunctionRecord>,
     /// Internal facts from this render, reconciled only by buffered drivers.
     pub pointerargs: Option<kuna_decomp::kuna_pointerargs::Record>,
+    /// The analysis warnings `code` carries as comments, each at the address
+    /// the engine recorded it at (in the target's address units). Empty on
+    /// every error record.
+    pub warnings: Vec<kuna_decomp::kuna_functionwarnings::Warning>,
     /// The token source map, captured only when the caller asked for it
     /// ([`DecompileOptions::want_tokens`]).
     pub detail: Option<Box<crate::inspect::FuncDetail>>,
@@ -599,6 +604,7 @@ pub fn decompile_pulled(
                 callee_hints: Vec::new(),
                 synth: None,
                 pointerargs: None,
+                warnings: Vec::new(),
                 detail: None,
             });
             continue;
@@ -638,6 +644,7 @@ pub fn decompile_pulled(
                 callee_hints: Vec::new(),
                 synth: None,
                 pointerargs: None,
+                warnings: Vec::new(),
                 detail: None,
             });
             continue;
@@ -665,6 +672,7 @@ pub fn decompile_pulled(
                 callee_hints: Vec::new(),
                 synth: None,
                 pointerargs: None,
+                warnings: Vec::new(),
                 detail: None,
             });
             continue;
@@ -740,7 +748,7 @@ pub fn decompile_pulled(
                 flow_overrides: &flow_ovr,
                 mapped_params: &seed.mapped_params,
             },
-            &[],
+            &seed.proto_overrides,
         );
         prog.arch_mut().kuna_record_names = false;
         // (kuna `--assert`) The symbol-scoped second pass. `name`/`type` name a
@@ -775,7 +783,7 @@ pub fn decompile_pulled(
                             flow_overrides: &flow_ovr,
                             mapped_params: &carried_params,
                         },
-                        &[],
+                        &seed.proto_overrides,
                     )
                     .result;
                     prog.arch_mut().kuna_prior_names = Default::default();
@@ -797,6 +805,18 @@ pub fn decompile_pulled(
                     single_target,
                     &fd,
                 );
+                crate::assertions::record_rejected_callee_overrides(
+                    prog,
+                    &name,
+                    single_target,
+                    &fd,
+                );
+                crate::assertions::record_unbound_call_prototypes(
+                    prog,
+                    &name,
+                    single_target,
+                    &fd,
+                );
                 // Render + extract under `catch_unwind`: the decompile drive only
                 // guards the pipeline (decompile_drive.rs), so a fail-fast invariant
                 // in the printer / type declarator on an exotic recovered function
@@ -806,6 +826,11 @@ pub fn decompile_pulled(
                 // (kuna `narrowargs callers`) Record what this function passes at each call.
                 if prog.arch().kuna_callerargs.recording {
                     kuna_decomp::kuna_callerargs::record(prog.arch_mut(), &park_entry, &fd);
+                }
+                // (kuna `calleereginputs custom`) Record what this function read on
+                // entry and the calls it printed, for the two-sided decision.
+                if kuna_decomp::kuna_calleereginputs::custom_applies(prog.arch()) {
+                    kuna_decomp::kuna_calleereginputs::record(prog.arch_mut(), &park_entry, &fd);
                 }
                 // (kuna `protoorder`) State what this function's recovery found for its callers.
                 if opts.park_recovered_proto {
@@ -841,6 +866,8 @@ pub fn decompile_pulled(
                     kuna_decomp::kuna_voidret::record(prog.arch_mut(), &park_entry, &fd);
                     // (kuna `elemptr`) And which of its pointers are indexed buffers.
                     kuna_decomp::kuna_elemptr::state(prog.arch_mut(), &park_entry, &fd);
+                    // (kuna `gottailcall`) And whether a tail call to it loses nothing.
+                    kuna_decomp::kuna_gottailcall::record(prog.arch_mut(), &park_entry, &fd);
                 }
                 // (kuna `calleevote`) Record what this function passes at each call.
                 if prog.arch().kuna_calleevote.recording {
@@ -879,6 +906,10 @@ pub fn decompile_pulled(
                         (print_c(prog.arch_mut(), &fd), Default::default(), Vec::new())
                     };
                     let pointerargs = prog.arch_mut().print_mut().take_pointer_arguments(&untrimmed);
+                    let mut warnings = prog.arch_mut().print_mut().take_warnings(&untrimmed);
+                    for address in warnings.iter_mut().filter_map(|w| w.address.as_mut()) {
+                        *address = prog.output_code_offset(*address);
+                    }
                     if let Some(err) = budget.error() {
                         return Err(err.explain().to_string());
                     }
@@ -939,7 +970,7 @@ pub fn decompile_pulled(
                     if budget.spent_in("extracting variables") {
                         return Err(budget.error().map(|e| e.explain().to_string()).unwrap_or_default());
                     }
-                    Ok::<_, String>((code, variables, types, (globals, field_calls, call_declarations, callwide_prototypes), proto, line_mappings, callee_hints, detail, pointerargs, stack_objects))
+                    Ok::<_, String>((code, variables, types, (globals, field_calls, call_declarations, callwide_prototypes), proto, line_mappings, callee_hints, detail, (pointerargs, warnings), stack_objects))
                 })).unwrap_or_else(|_| {
                     Err(budget.error().map_or_else(
                         || "panic while rendering C / extracting variables".to_string(),
@@ -949,8 +980,11 @@ pub fn decompile_pulled(
                 drop(budget);
                 fd.set_display_name(&original_display);
                 match rendered {
-                    Ok((code, variables, types, (globals, field_calls, call_declarations, callwide_prototypes), proto, line_mappings, callee_hints, detail, pointerargs, stack_objects)) => {
+                    Ok((code, variables, types, (globals, field_calls, call_declarations, callwide_prototypes), proto, line_mappings, callee_hints, detail, (pointerargs, warnings), stack_objects)) => {
                     crate::assertions::verify_printed(prog, &fd, &code, &replayed);
+                    if replay {
+                        crate::assertions::verify_formats(prog, &fd, &name, single_target);
+                    }
                     sink(FuncResult {
                         name,
                         address,
@@ -973,6 +1007,7 @@ pub fn decompile_pulled(
                         callee_hints,
                         synth: None,
                         pointerargs,
+                        warnings,
                         detail,
                     })
                     }
@@ -998,6 +1033,7 @@ pub fn decompile_pulled(
                         callee_hints: Vec::new(),
                         synth: None,
                         pointerargs: None,
+                        warnings: Vec::new(),
                         detail: None,
                     }),
                 }
@@ -1024,6 +1060,7 @@ pub fn decompile_pulled(
                 callee_hints: Vec::new(),
                 synth: None,
                 pointerargs: None,
+                warnings: Vec::new(),
                 detail: None,
             }),
         }
@@ -1067,11 +1104,7 @@ impl CalleeHintContext {
     fn new(prog: &ConsoleProgram) -> Self {
         let arm = prog.description().starts_with("ARM");
         let normalize = |vma: u64| if arm { vma & !1 } else { vma };
-        let mut entries: Vec<u64> = prog
-            .function_entries()
-            .filter(|(_, addr)| addr.get_space().is_some())
-            .map(|(_, addr)| normalize(addr.get_offset()))
-            .collect();
+        let mut entries: Vec<u64> = prog.entry_offsets().into_iter().map(normalize).collect();
         entries.sort_unstable();
         entries.dedup();
         // Sections first, segments where the container publishes no section
@@ -1401,6 +1434,17 @@ pub fn deferred_callwide_header<'a>(
 /// The type block is filtered by [`prune_unreferenced_synth_types`] first, so a
 /// synthesized structure the document no longer names is not declared.
 pub fn build_header(file_name: &str, prelude: &str, types: &str, results: &[FuncResult]) -> Result<String, String> {
+    build_header_with_names(file_name, prelude, types, results, &GlobalAliasNames::from_results(results))
+}
+
+/// Build a header with name evidence collected before streaming discarded the bodies.
+pub fn build_header_with_names(
+    file_name: &str,
+    prelude: &str,
+    types: &str,
+    results: &[FuncResult],
+    names: &GlobalAliasNames,
+) -> Result<String, String> {
     let guard = sanitize_guard(file_name);
     let types = &declare_called_fields(&prune_unreferenced_synth_types(types, results), results);
     validate_callwide_header(prelude, types, results.iter())?;
@@ -1419,7 +1463,7 @@ pub fn build_header(file_name: &str, prelude: &str, types: &str, results: &[Func
             let _ = writeln!(out, "/* {conflict} */");
         }
     }
-    let globals = global_declarations(results);
+    let globals = global_declarations(results, names, &[prelude, types]);
     if !globals.is_empty() {
         out.push_str("\n/* globals the code names by address */\n");
         out.push_str(&globals);
@@ -1509,7 +1553,12 @@ pub fn build_header(file_name: &str, prelude: &str, types: &str, results: &[Func
 ///   then the earlier function.
 ///
 /// Every other type is listed in a comment on the line.
-fn global_declarations(results: &[FuncResult]) -> String {
+fn global_declarations(results: &[FuncResult], names: &GlobalAliasNames, header: &[&str]) -> String {
+    let string_views = if names.covers(results) {
+        crate::kuna_stringoverlaps::declarations(results.iter().flat_map(|r| r.globals.iter()), names.occupied(), header)
+    } else {
+        BTreeMap::new()
+    };
     let mut by_addr: BTreeMap<u64, (Vec<&GlobalInfo>, Vec<&GlobalInfo>)> = BTreeMap::new();
     for g in results.iter().flat_map(|r| r.globals.iter()) {
         let e = by_addr.entry(g.address).or_default();
@@ -1586,7 +1635,11 @@ fn global_declarations(results: &[FuncResult]) -> String {
             }
         };
         if let Some(other) = overlap.filter(|_| taken.is_empty() && !direct.iter().any(|g| g.elem)) {
-            let _ = writeln!(out, "/* {name} is overlapped by {other}, so it is not declared: {} */", quote(&chosen));
+            if let Some(declaration) = string_views.get(&address) {
+                let _ = writeln!(out, "{declaration}");
+            } else {
+                let _ = writeln!(out, "/* {name} is overlapped by {other}, so it is not declared: {} */", quote(&chosen));
+            }
             continue;
         }
         let others: Vec<String> =
@@ -1911,6 +1964,10 @@ mod tests {
         FuncResult,
     };
 
+    fn global_declarations(results: &[FuncResult]) -> String {
+        super::global_declarations(results, &super::GlobalAliasNames::from_results(results), &[])
+    }
+
     #[test]
     fn named_globals_do_not_collapse_distinct_storage_or_split_aliases() {
         let mut result = streamed("void sample(void)", "int");
@@ -1926,13 +1983,13 @@ mod tests {
             integer: true,
         };
         result.globals = vec![object("counter", 0x5000), object("counter", 0x5000)];
-        assert_eq!(super::global_declarations(std::slice::from_ref(&result)), "extern unsigned int counter;\n");
+        assert_eq!(global_declarations(std::slice::from_ref(&result)), "extern unsigned int counter;\n");
         result.globals.push(object("counter", 0x6000));
-        let declarations = super::global_declarations(std::slice::from_ref(&result));
+        let declarations = global_declarations(std::slice::from_ref(&result));
         assert!(declarations.contains("multiple storage addresses"), "{declarations}");
         assert!(!declarations.contains("extern "), "{declarations}");
         result.globals = vec![object("counter", 0x5000), object("alias", 0x5000)];
-        let declarations = super::global_declarations(&[result]);
+        let declarations = global_declarations(&[result]);
         assert!(declarations.contains("aliases require shared storage"), "{declarations}");
         assert!(!declarations.contains("extern "), "{declarations}");
         let mut whole = object("whole", 0x5000);
@@ -1940,7 +1997,7 @@ mod tests {
         whole.declaration = "unsigned long whole".into();
         let mut result = streamed("void sample(void)", "int");
         result.globals = vec![whole, object("interior", 0x5004)];
-        let declarations = super::global_declarations(&[result]);
+        let declarations = global_declarations(&[result]);
         assert!(declarations.contains("overlapped"), "{declarations}");
         assert!(!declarations.contains("extern "), "{declarations}");
     }
@@ -1962,14 +2019,14 @@ mod tests {
         agnostic.globals = vec![named("unsigned long count", true, true)];
         let mut signed = streamed("int test(void)", "int");
         signed.globals = vec![named("long count", false, true)];
-        let declarations = super::global_declarations(&[agnostic.clone(), signed]);
+        let declarations = global_declarations(&[agnostic.clone(), signed]);
         assert_eq!(declarations, "extern long count;\n");
         let mut pointer = streamed("char *name(void)", "int");
         pointer.globals = vec![named("char *count", false, false)];
-        let declarations = super::global_declarations(&[agnostic.clone(), pointer]);
+        let declarations = global_declarations(&[agnostic.clone(), pointer]);
         assert!(declarations.contains("read at two types"), "{declarations}");
         assert!(!declarations.contains("extern "), "{declarations}");
-        let declarations = super::global_declarations(std::slice::from_ref(&agnostic));
+        let declarations = global_declarations(std::slice::from_ref(&agnostic));
         assert_eq!(declarations, "extern unsigned long count;\n");
     }
 
@@ -1988,9 +2045,9 @@ mod tests {
             integer: ty != "float",
         };
         result.globals = vec![direct("unsigned int")];
-        assert_eq!(super::global_declarations(std::slice::from_ref(&result)), "extern unsigned int dat_5000;\n");
+        assert_eq!(global_declarations(std::slice::from_ref(&result)), "extern unsigned int dat_5000;\n");
         result.globals.push(direct("float"));
-        let declarations = super::global_declarations(&[result]);
+        let declarations = global_declarations(&[result]);
         assert!(!declarations.contains("extern "), "{declarations}");
         assert!(declarations.contains("read at two types"), "{declarations}");
         assert!(declarations.contains("unsigned int dat_5000"), "{declarations}");
@@ -2012,18 +2069,100 @@ mod tests {
         };
         let mut result = streamed("void sample(void)", "int");
         result.globals = vec![global(0x5000, "unsigned int", 4, true), global(0x5004, "unsigned int", 4, true)];
-        let adjacent = super::global_declarations(std::slice::from_ref(&result));
+        let adjacent = global_declarations(std::slice::from_ref(&result));
         assert_eq!(adjacent, "extern unsigned int dat_5000;\nextern unsigned int dat_5004;\n");
         result.globals = vec![global(0x5000, "unsigned long", 8, true), global(0x5004, "unsigned int", 4, true)];
-        let split = super::global_declarations(std::slice::from_ref(&result));
+        let split = global_declarations(std::slice::from_ref(&result));
         assert!(!split.contains("extern "), "{split}");
         assert!(split.contains("dat_5000 is overlapped by dat_5004"), "{split}");
         assert!(split.contains("dat_5004 is overlapped by dat_5000"), "{split}");
         result.globals = vec![global(0x5000, "long", 8, false), global(0x5004, "int", 4, true)];
-        let taken = super::global_declarations(&[result]);
+        let taken = global_declarations(&[result]);
         assert!(taken.starts_with("extern long dat_5000;\n"), "{taken}");
         assert!(taken.contains("dat_5004 is overlapped by dat_5000"), "{taken}");
         assert!(!taken.contains("extern int dat_5004"), "{taken}");
+    }
+
+    #[test]
+    fn overlapping_string_arrays_share_one_declared_owner() {
+        let string = |name: &str, address, size| super::GlobalInfo {
+            address, name: name.into(), declaration: format!("char {name}[{size}]"), size,
+            unknown: false, direct: true, aggregate: false, elem: false, integer: false,
+        };
+        let mut result = streamed("void sample(void)", "int");
+        result.globals = vec![string("whole", 0x5000, 16), string("part", 0x5004, 8)];
+        result.code = Some("void sample(void) { consume(whole,part); }".into());
+        assert_eq!(
+            global_declarations(&[result]),
+            "extern char whole[16];\n#define part (*(char (*)[8])((unsigned char *)&whole + 0x4))\n",
+        );
+    }
+
+    #[test]
+    fn overlapping_string_aliases_keep_shadowed_names_diagnostic() {
+        let string = |name: &str, address, size| super::GlobalInfo {
+            address, name: name.into(), declaration: format!("char {name}[{size}]"), size,
+            unknown: false, direct: true, aggregate: false, elem: false, integer: false,
+        };
+        let mut result = streamed("void sample(void)", "int");
+        result.globals = vec![string("whole", 0x5000, 16), string("part", 0x5004, 8)];
+        for (prototype, code) in [
+            ("void sample(char *part);", "void sample(char *part) {}"),
+            ("void sample(void);", "void sample(void) {\n  char whole[16]; // local\n  consume(part);\n}"),
+            ("void sample(void);", "void sample(void) {\n  consume(other->part);\n}"),
+        ] {
+            result.proto = Some(prototype.into());
+            result.code = Some(code.into());
+            let declarations = global_declarations(std::slice::from_ref(&result));
+            assert!(declarations.contains("whole is overlapped by part"), "{declarations}");
+            assert!(!declarations.contains("#define"), "{declarations}");
+        }
+    }
+
+    #[test]
+    fn overlapping_string_aliases_retain_name_evidence_after_streaming() {
+        let string = |name: &str, address, size| super::GlobalInfo {
+            address, name: name.into(), declaration: format!("char {name}[{size}]"), size,
+            unknown: false, direct: true, aggregate: false, elem: false, integer: false,
+        };
+        let mut result = streamed("char *sample(void)", "int");
+        result.globals = vec![string("whole", 0x5000, 16), string("part", 0x5004, 8)];
+        for body in [
+            "char *sample(void) {\n  return part;\n}",
+            "char *sample(void) {\n  char whole[16]; // local\n  return part;\n}",
+        ] {
+            result.code = Some(body.into());
+            let records = std::slice::from_ref(&result);
+            let buffered = super::build_header("sample", "", "", records).unwrap();
+            let names = super::GlobalAliasNames::from_results(records);
+            result.code = None;
+            let streamed = super::build_header_with_names("sample", "", "", std::slice::from_ref(&result), &names).unwrap();
+            assert_eq!(streamed, buffered);
+            assert_eq!(streamed.contains("#define part"), !body.contains("char whole"));
+            let missing = super::build_header("sample", "", "", std::slice::from_ref(&result)).unwrap();
+            assert!(!missing.contains("#define part"), "{missing}");
+        }
+    }
+
+    #[test]
+    fn overlapping_string_aliases_respect_header_and_call_names() {
+        let string = |name: &str, address, size| super::GlobalInfo {
+            address, name: name.into(), declaration: format!("char {name}[{size}]"), size,
+            unknown: false, direct: true, aggregate: false, elem: false, integer: false,
+        };
+        let mut result = streamed("void sample(void)", "int");
+        result.globals = vec![string("whole", 0x5000, 16), string("part", 0x5004, 8)];
+        result.code = Some("void sample(void) { consume(whole, part); }".into());
+        for (prelude, types, calls) in [
+            ("#define part 3\n", "", vec![]),
+            ("", "typedef int whole;\n", vec![]),
+            ("", "", vec!["int helper(int part);".into()]),
+        ] {
+            result.call_declarations = calls;
+            let header = super::build_header("sample", prelude, types, std::slice::from_ref(&result)).unwrap();
+            assert!(header.contains("whole is overlapped by part"), "{header}");
+            assert!(!header.contains("#define part (*"), "{header}");
+        }
     }
 
     #[test]
@@ -2189,6 +2328,7 @@ mod tests {
             callee_hints: vec![],
             synth: None,
             pointerargs: None,
+            warnings: Vec::new(),
             detail: None,
         }
     }

@@ -11,7 +11,7 @@
 //! functions, whose own tables run on the same way, so a 1.3 KB serde-hkx
 //! serializer decodes 4,791 blocks of 64 other functions.
 //!
-//! With the option on, the sanity check of a table its model found no guard
+//! The sanity check of a table its model found no guard
 //! for keeps only its leading rows inside the function (from its entry to the
 //! next known function entry) when every later row lands outside it, in at
 //! least two other functions. Those functions' tables lie after this one, so
@@ -22,6 +22,16 @@
 //! rows all land in one function, or that comes back into its own function
 //! after leaving it, is kept whole, so a split-off case or a misplaced
 //! function start cannot be cut. The rows cut are not dispatched.
+//!
+//! The model records the conditional branches just before the dispatch as
+//! guards whether or not they test the selector. A table also counts as
+//! unguarded when the variable it was sized
+//! from can still take the largest value its width allows: the `jnz` on a
+//! call's Result tag in front of a Rust deserializer's byte key dispatch
+//! limits nothing, and a `cmp eax,1; je` that sends one key elsewhere only
+//! takes out a value. A range that then wraps past its top (2..0xff, then
+//! 0) is read in value order, so its last row, case 0, is not a row that
+//! comes back into the function.
 
 /// The number of leading rows of `rows` (table destinations) that belong to
 /// the function at `entry`, when the rest run on forward into other

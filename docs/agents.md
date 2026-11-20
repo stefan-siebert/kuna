@@ -106,14 +106,31 @@ phases are **settable assertions/options** (`--option NAME VALUE`, discovered vi
 
 ## Adding features (the enforced rules)
 
-- **Anything that can change emitted C ships behind a named option** — a `settableTable`
-  row in `decompiler/crates/kuna-decomp/phases.toml` (every field populated, including
-  `tier` + `symptoms`) plus a handler in `src/p0_knowledge/kuna_option_dispatch.rs`; `kuna catalog
-  --check` must stay green. Options can take values, not just on/off. New logic goes in a
-  `kuna_<slug>.rs` module inside its owning phase folder (canonical template:
-  `p2_lift/kuna_loweredswitch.rs`). This is for *features* — behavior that is a judgment
-  call, not universally better; a strict bug fix that only corrects wrong output needs no
-  flag (when in doubt, gate it).
+- **A judgement call ships behind a named option; a fix does not.** An option is a
+  `settableTable` row in `decompiler/crates/kuna-decomp/phases.toml` (every field populated,
+  including `tier` + `symptoms`) plus a handler in `src/p0_knowledge/kuna_option_dispatch.rs`;
+  `kuna catalog --check` must stay green. Options can take values, not just on/off. New logic
+  goes in a `kuna_<slug>.rs` module inside its owning phase folder (canonical template:
+  `p2_lift/kuna_loweredswitch.rs`). An option exists only where the outcome is questionable:
+  a faithfulness-vs-readability choice, a speculative or destructive recovery, a speed trade,
+  a heuristic scanner. A **strict correctness fix** — one whose `off` value would only
+  reproduce output that is false about the program — ships with **no flag**, always on, and
+  its stage test pins the fixed output in one pass. The agent reading `kuna catalog` pays
+  for every row, so do not gate "when in doubt"; decide.
+- **A refinement extends the option it refines.** A guard, a widening or a second case of an
+  existing feature becomes part of that feature (unconditional when the parent is on) or a
+  new *value* of the parent's option, never a sibling flag (`calleearity` once had five).
+- **A target-gated feature defaults on and says so.** Anything that applies only to one
+  architecture, OS, container format or source language (PE RTTI, Mach-O ObjC, ARM literal
+  pools, Go/Rust ABI) is enabled automatically on that target, is inert everywhere else, and
+  its `phases.toml` row names the target in its first sentence. "Needs evidence" is answered
+  by the on-target sweep plus an off-target byte-identical sweep, not by shipping it off.
+- **The catalog default is the product default.** If the `auto` mode would turn an option on
+  for every binary of every size, that is the catalog default; the vendored datatest corpus
+  pins the upstream spelling per test (`<com>option NAME off</com>`), as `returndup` and
+  `truthycond` do. Presets (`docs/modes.md`) exist for size and risk trade-offs, not to hide
+  a better default. The decisions behind these rules, option by option:
+  `docs/option-surface-study.md`.
 - **Adding an option also bumps hard-coded catalog counts** — the count tests in
   `kuna_phases/tests.rs`, the `tests/catalog_bytecompat.rs` fixture, and the
   `tests/stages/kuna-catalog.xml` count assertions. Grep for the current total, or
@@ -162,6 +179,7 @@ phases are **settable assertions/options** (`--option NAME VALUE`, discovered vi
   `decompiler/crates/kuna-base/src/xml.rs` and requires re-recording
   `docs/baseline-stages.json`. Two such PRs in flight WILL conflict on both; resolve the count
   to base + all merged, and re-record the baseline rather than hand-merging it.
+- Opening a PR: do not open an issue first (the PR describes the problem), do not @-mention the maintainers, and end the body with the line `Model: <model id>` naming the model that generated it. Details in `docs/pr-bodies.md`.
 - Any time any public thing is created fully automatically, it should start with `[AUTOMATED]`. That goes for PRs, Issues (opening and responses), and most importantly replies or comments to issues/PRs. It should also be in the commit message, but can go outside of the tagline and more inside the extended part.
 - **PR bodies** lead with a runnable repro, stay under one screen, and never mention our
   internal process (milestones, review rounds, agents, gate runs). The full rules are in
@@ -176,6 +194,7 @@ phases are **settable assertions/options** (`--option NAME VALUE`, discovered vi
 | `docs/options.md` | The generated option catalog (tiers, symptoms, flip guidance). |
 | `docs/cli.md` | The full `kuna` CLI reference. |
 | `docs/pr-bodies.md` | How to write a PR body (read before opening or editing any PR). |
+| `docs/prepr.md` | Optional pre-PR helpers: a call-arity diff over real MSVC binaries, and a diff lint. |
 | `docs/improvement-pipeline.md` | The autonomous improvement pipeline + standing requirements for feature PRs. |
 | `docs/re-pipeline.md` | The RE-friction loop: agents solve crackmes with kuna, record where it fails them, and close those gaps. The second, self-merging lane. |
 | `docs/decbench-loop.md` | The decbench benchmark / improvement campaign. |

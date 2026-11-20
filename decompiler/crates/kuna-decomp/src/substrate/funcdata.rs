@@ -275,9 +275,16 @@ pub struct Funcdata {
     /// dead-op removal took out and the Varnodes it read
     /// (`infra/action.rs (ActionPool::apply_wave)`).
     dead_wave_log: Option<(Vec<OpId>, Vec<VarnodeId>)>,
+    /// (kuna `deadcascade`) Does dead-op removal in the running pool pass take
+    /// the dead chain behind the removed op out with it?
+    dead_cascade_now: bool,
     /// (kuna decompile-all watchdog) What was left of the per-function budget
     /// when the drive handed this function back; rendering it may use no more.
     render_budget: Option<std::time::Duration>,
+    /// (kuna decompile-all watchdog) How long following this function's flow
+    /// took outside a drive (the console's `load`); a drive that adopts it
+    /// charges that to its budget.
+    flow_spent: std::time::Duration,
     /// List of jump-tables for this function (C++ `jumpvec`).
     ///
     /// The real `JumpTable` (`jumptable.{hh,cc}`) now lives here: the recovery
@@ -325,6 +332,8 @@ pub struct Funcdata {
     /// *is* that pointer; here the entries live inline and the offset is the
     /// vector index (the faithful equivalent — see `newVarnodeCallSpecs`).
     qlst: Vec<FuncCallSpecs>,
+    /// Proofs belong to this entry's flow only, and are rebuilt after clear/restart.
+    pub(crate) ppc32_pic_calls: std::collections::BTreeMap<u64, crate::kuna_ppc32piccalls::CallBinding>,
     /// HighVariable merging engine (C++ `Merge covermerge`, `funcdata.hh:91`).
     ///
     /// The C++ `Funcdata` owns a single `Merge` whose `copyTrims` accumulator
@@ -432,6 +441,9 @@ pub struct Funcdata {
     /// is what lets the front-ends report the rejection (`--assert` ledger, exit
     /// code) while still emitting the C.
     kuna_rejected_flow: Vec<(Address, kuna_base::types::uint4, String)>,
+    /// (kuna `--assert callee`) The caller-stated indirect-call destinations
+    /// the followed flow did not apply, as `(call site, callee, reason)`.
+    kuna_rejected_callee: Vec<(Address, Address, String)>,
     /// (kuna `--assert`) The local-scope Symbols the `name`/`type` directives
     /// applied to THIS pass renamed, retyped or created, each keyed back to the
     /// identifier the pass printed for its variable.  A rebuilt `Funcdata` starts
@@ -488,12 +500,15 @@ pub struct Funcdata {
     /// `(space index, entry offset)`.  Seeded by the driver after the flow build
     /// — the only place the disassembly engine is still reachable — and read at
     /// the input-trial scoring seam
-    /// ([`crate::kuna_calleedeadarg::trial_is_dead_in_callee`]).  Empty unless
-    /// `option calleedeadarg` is live for this function.
+    /// ([`crate::kuna_calleedeadarg::trial_is_dead_in_callee`]).
     kuna_callee_entry_dead: std::collections::HashMap<
         (int4, kuna_base::types::uintb),
         std::rc::Rc<crate::kuna_calleedeadarg::CalleeEntryDead>,
     >,
+    /// (kuna `swiftcall`) Direct callees whose bodies do not read `swiftself`
+    /// before writing it, by `(space index, entry offset)`; seeded by
+    /// [`crate::kuna_swiftcall::seed_self_readers`].
+    kuna_swift_self_unread: std::collections::HashSet<(int4, kuna_base::types::uintb)>,
     /// (kuna `hiddenretarg`) The values a veto removed from a call's
     /// hidden-return register, as the leaves
     /// [`crate::kuna_hiddenretarg::value_leaves`] finds. Cleared with the
@@ -630,6 +645,11 @@ pub struct Funcdata {
     /// (kuna `elfmain`) The C runtime's `main` declaration this function's inputs
     /// take, when it is an executable's own `main`. See [`crate::kuna_elfmaindecl`].
     kuna_elfmain: Option<std::rc::Rc<crate::kuna_elfmaindecl::Runtime>>,
+    pub(crate) kuna_go_receiver: Option<crate::kuna_gopointermethod::Receiver>,
+    go_string_input: Option<Box<crate::kuna_gostringinput::GoStringInput>>,
+    /// (kuna `swiftcall`) Names and types for the inputs this function's
+    /// analysis recovers. See [`crate::kuna_inputhints`].
+    kuna_input_hints: Option<std::rc::Rc<Vec<crate::kuna_inputhints::InputHint>>>,
     /// (kuna `calleevote fields`) Every caller of this function is a known direct call.
     kuna_calleevote_closed: bool,
     /// (kuna `elemptr`) The globals this function must not type as element
@@ -667,9 +687,9 @@ pub struct Funcdata {
     /// (kuna `retpushedhalf`) Registers this function only ever pushed, gathered
     /// during the flow build while the store and the load still exist and read at
     /// the return-half placement test
-    /// ([`crate::kuna_retpushedhalf::PushedRegisters`]).  Empty unless
-    /// `option retpushedhalf` is live for this function.
+    /// ([`crate::kuna_retpushedhalf::PushedRegisters`]).
     kuna_pushed_registers: crate::kuna_retpushedhalf::PushedRegisters,
+    pub(crate) kuna_atomic_xadds: Vec<crate::p2_lift::kuna_atomicxadd::Instruction>,
 }
 
 /// Opaque handle for a jump-table (C++ `JumpTable *` slot in `jumpvec`).
@@ -788,7 +808,9 @@ impl Funcdata {
             kuna_condstmts_hits: std::collections::BTreeSet::new(),
             kuna_restart_now: false,
             dead_wave_log: None,
+            dead_cascade_now: false,
             render_budget: None,
+            flow_spent: std::time::Duration::ZERO,
             jumpvec: Vec::new(),
             vbank,
             kuna_storage_sources: Default::default(),
@@ -803,6 +825,7 @@ impl Funcdata {
             high_bank: crate::variable::HighVariableBank::new(),
             heritage: crate::heritage::Heritage::new(),
             qlst: Vec::new(),
+            ppc32_pic_calls: Default::default(),
             covermerge: None,
             cover_blocks: None,
             affecting_ops_revision: 0,
@@ -824,6 +847,7 @@ impl Funcdata {
             kuna_call_mechanisms: Default::default(),
             kuna_fspec_handles: Vec::new(),
             kuna_rejected_flow: Vec::new(),
+            kuna_rejected_callee: Vec::new(),
             kuna_directive_symbols: Vec::new(),
             kuna_prior_names: Default::default(),
             kuna_default_name_end: 1,
@@ -838,6 +862,7 @@ impl Funcdata {
             kuna_wide: None,
             kuna_callwide: None,
             kuna_callee_entry_dead: std::collections::HashMap::new(),
+            kuna_swift_self_unread: std::collections::HashSet::new(),
             kuna_hiddenret_vetoed: std::collections::HashSet::new(),
             kuna_own_entry_dead: None,
             kuna_callee_entry_through: std::collections::HashMap::new(),
@@ -876,6 +901,9 @@ impl Funcdata {
             kuna_calleevote_inputs: None,
             kuna_callerargs: None,
             kuna_elfmain: None,
+            kuna_go_receiver: None,
+            go_string_input: None,
+            kuna_input_hints: None,
             kuna_calleevote_closed: false,
             kuna_elemptr_blocked: None,
             kuna_elemptr_adopt: None,
@@ -888,6 +916,7 @@ impl Funcdata {
             kuna_elemptr_no_objects: false,
             kuna_elemptr_stated: std::collections::HashMap::new(),
             kuna_pushed_registers: crate::kuna_retpushedhalf::PushedRegisters::default(),
+            kuna_atomic_xadds: Vec::new(),
         })
     }
 
@@ -975,6 +1004,17 @@ impl Funcdata {
         std::mem::take(&mut self.pending_comments)
     }
 
+    /// How many analysis comments are buffered (a mark for
+    /// [`Self::truncate_pending_comments`]).
+    pub fn pending_comment_count(&self) -> usize {
+        self.pending_comments.len()
+    }
+
+    /// Drop the comments buffered after `mark`: a discarded flow's statements.
+    pub fn truncate_pending_comments(&mut self, mark: usize) {
+        self.pending_comments.truncate(mark);
+    }
+
     /// Read-only view of the buffered analysis comments (the
     /// `(comment_type, placement_address, text)` triples that
     /// [`Self::drain_pending_comments`] will hand to the console `Architecture`'s
@@ -1040,6 +1080,21 @@ impl Funcdata {
     /// (kuna) The flow overrides this function's flow follow refused.
     pub fn kuna_rejected_flow_overrides(&self) -> &[(Address, kuna_base::types::uint4, String)] {
         &self.kuna_rejected_flow
+    }
+
+    /// (kuna) Record a stated indirect-call destination the flow did not apply.
+    /// Idempotent per call site.
+    pub fn note_rejected_callee_override(&mut self, site: Address, callee: Address, reason: &str) {
+        if self.kuna_rejected_callee.iter().any(|(s, _, _)| s == &site) {
+            return;
+        }
+        self.kuna_rejected_callee.push((site, callee, reason.to_string()));
+    }
+
+    /// (kuna) The stated indirect-call destinations this function's flow did
+    /// not apply.
+    pub fn kuna_rejected_callee_overrides(&self) -> &[(Address, Address, String)] {
+        &self.kuna_rejected_callee
     }
 
     /// (kuna `--assert`) The Symbols a `name`/`type` directive touched on this pass.
@@ -1178,6 +1233,19 @@ impl Funcdata {
         if let Some(sp) = entry.get_space() {
             self.kuna_callee_entry_dead.insert((sp.get_index(), entry.get_offset()), dead);
         }
+    }
+
+    /// (kuna `swiftcall`) Record that `entry`'s body does not read `swiftself`
+    /// before writing it.
+    pub fn kuna_set_swift_self_unread(&mut self, entry: &Address) {
+        if let Some(sp) = entry.get_space() {
+            self.kuna_swift_self_unread.insert((sp.get_index(), entry.get_offset()));
+        }
+    }
+
+    /// (kuna `swiftcall`) Was `entry`'s body seen not to read `swiftself` first?
+    pub fn kuna_swift_self_unread(&self, entry: &Address) -> bool {
+        entry.get_space().is_some_and(|sp| self.kuna_swift_self_unread.contains(&(sp.get_index(), entry.get_offset())))
     }
 
     /// (kuna `calleedeadarg`) The recorded entry-liveness probe of `entry`'s
@@ -1589,6 +1657,24 @@ impl Funcdata {
     /// (kuna `elfmain`) The C runtime's `main` declaration for this function.
     pub fn kuna_elfmain(&self) -> Option<&crate::kuna_elfmaindecl::Runtime> {
         self.kuna_elfmain.as_deref()
+    }
+
+    pub(crate) fn set_go_string_input(&mut self, formal: Option<crate::kuna_gostringinput::GoStringInput>) {
+        self.go_string_input = formal.map(Box::new);
+    }
+
+    pub(crate) fn go_string_input(&self) -> Option<&crate::kuna_gostringinput::GoStringInput> {
+        self.go_string_input.as_deref()
+    }
+
+    /// (kuna `swiftcall`) Seed the input hints. See [`crate::kuna_inputhints`].
+    pub fn kuna_set_input_hints(&mut self, hints: Option<std::rc::Rc<Vec<crate::kuna_inputhints::InputHint>>>) {
+        self.kuna_input_hints = hints;
+    }
+
+    /// (kuna `swiftcall`) The input hints of this function.
+    pub fn kuna_input_hints(&self) -> Option<&[crate::kuna_inputhints::InputHint]> {
+        self.kuna_input_hints.as_deref().map(Vec::as_slice)
     }
 
     /// (kuna `calleevote fields`) Mark every caller of this function as known.
@@ -2415,7 +2501,7 @@ impl Funcdata {
 
     /// (kuna `stackstoreguard`) Is the guard on for this function?
     pub fn stack_store_guard(&self) -> bool {
-        self.get_arch().stack_store_guard && !self.stack_store_guard_withdrawn.get()
+        !self.stack_store_guard_withdrawn.get()
     }
 
     pub(crate) fn note_stack_byte_copy_op(&mut self, op: OpId) {
@@ -2496,6 +2582,18 @@ impl Funcdata {
         self.kuna_restart_now = true;
     }
 
+    /// (kuna `deadcascade`) Set whether dead-op removal in the running pool
+    /// pass cascades.
+    pub(crate) fn set_dead_cascade_now(&mut self, on: bool) {
+        self.dead_cascade_now = on;
+    }
+
+    /// (kuna `deadcascade`) Does dead-op removal in the running pool pass
+    /// cascade?
+    pub(crate) fn dead_cascade_now(&self) -> bool {
+        self.dead_cascade_now
+    }
+
     /// (kuna `deadwaves`) Start recording dead-op removals for a pool pass.
     pub(crate) fn start_dead_wave_log(&mut self) {
         self.dead_wave_log = Some((Vec::new(), Vec::new()));
@@ -2534,9 +2632,40 @@ impl Funcdata {
         log.1.extend((0..o.num_input()).filter_map(|k| o.get_in(k)));
     }
 
+    /// (kuna `copywaves`) Record that `op`'s input `old` is being replaced by
+    /// `new`: the op and each Varnode it touches, its inputs, the one replaced,
+    /// the one replacing it and its output.
+    pub(crate) fn note_wave_input_change(&mut self, op: OpId, old: VarnodeId, new: VarnodeId) {
+        let Some(log) = self.dead_wave_log.as_mut() else {
+            return;
+        };
+        let Some(o) = self.obank.get(op) else {
+            return;
+        };
+        log.0.push(op);
+        let mut vns: Vec<VarnodeId> = (0..o.num_input()).filter_map(|k| o.get_in(k)).collect();
+        vns.push(old);
+        vns.push(new);
+        vns.extend(o.get_out());
+        vns.sort_unstable();
+        vns.dedup();
+        log.1.extend(vns);
+    }
+
     /// (kuna decompile-all watchdog) What the drive left of the budget for rendering.
     pub fn render_budget(&self) -> Option<std::time::Duration> {
         self.render_budget
+    }
+
+    /// (kuna decompile-all watchdog) How long this function's flow follow took
+    /// before a drive adopted it.
+    pub fn flow_spent(&self) -> std::time::Duration {
+        self.flow_spent
+    }
+
+    /// (kuna decompile-all watchdog) Record how long the flow follow took.
+    pub fn set_flow_spent(&mut self, spent: std::time::Duration) {
+        self.flow_spent = spent;
     }
 
     /// (kuna decompile-all watchdog) Record what the drive left of the budget.
@@ -2988,9 +3117,8 @@ impl Funcdata {
         if self.localmap.is_none() || !self.funcp.has_model() {
             return;
         }
-        let spec = self.get_arch().proto_ranges;
-        let local = self.funcp.local_range(spec).clone();
-        let param = self.funcp.param_range(spec).clone();
+        let local = self.funcp.get_local_range().clone();
+        let param = self.funcp.get_param_range().clone();
         let grows_neg = self.funcp.is_stack_grows_negative();
         if let Some(sl) = self.localmap.as_mut() {
             sl.reset_local_window(&local, &param, grows_neg);
@@ -3372,17 +3500,42 @@ impl Funcdata {
             return;
         }
         let homes = self.kuna_storage_sources.entry(destination).or_default();
+        // Preserve first-seen order. Index only large merges so small vectors
+        // and single-source updates do not allocate a temporary hash table.
+        let address_key = |address: &Address| {
+            use kuna_base::address::AddrSpacePtr;
+            let space = match address.base_ptr() {
+                AddrSpacePtr::Null => 0,
+                AddrSpacePtr::Max => usize::MAX,
+                AddrSpacePtr::Spc(space) => std::rc::Rc::as_ptr(space) as usize,
+            };
+            (space, address.get_offset())
+        };
+        let key = |source: &crate::kuna_varsources::StorageSource| {
+            (address_key(&source.address), source.size, source.write_address.as_ref().map(address_key))
+        };
+        let mut seen = (homes.len() >= 64 && sources.size_hint().0 >= 16).then(|| {
+            let mut seen = crate::kuna_fasthash::FxHashSet::default();
+            seen.reserve(homes.len());
+            seen.extend(homes.iter().map(key));
+            seen
+        });
         for source in sources {
             if Self::kuna_storage_write_matches(&self.kuna_denied_storage_writes, &source)
                 && !Self::kuna_storage_write_matches(&self.kuna_meaningful_storage_writes, &source)
             {
                 continue;
             }
-            if !homes.iter().any(|home| {
+            let new = if let Some(seen) = &mut seen {
+                seen.insert(key(&source))
+            } else {
+                !homes.iter().any(|home| {
                 home.address == source.address
                     && home.size == source.size
                     && home.write_address == source.write_address
-            }) {
+                })
+            };
+            if new {
                 homes.push(source);
             }
         }
@@ -4014,9 +4167,11 @@ impl Funcdata {
     /// op's parent, splice it onto the per-op intrusive basic-block list before
     /// `before`, then compute `ordbefore`/`ordafter` from neighbours and either
     /// set an overflow-safe midpoint or recompute the whole order. An append that
-    /// finds no room renumbers into the lower half of the order space, so later
-    /// appends do not renumber the block again every few ops. The BRANCHIND
-    /// `f_switch_out` mark is applied via the block flags.
+    /// finds no room renumbers into the lower half of the order space, and an
+    /// append that makes a block 256 ops or longer takes a gap that shrinks with
+    /// the block's length, so each renumbering leaves room for as many appends as
+    /// the block already holds and building a block stays linear in its ops.
+    /// The BRANCHIND `f_switch_out` mark is applied via the block flags.
     pub fn bb_insert_op(&mut self, op: OpId, bl: BlockId, before: Option<OpId>) {
         if self.op_is_call_or_store(op) {
             self.affecting_ops_changed();
@@ -4054,7 +4209,8 @@ impl Funcdata {
         // on overflow) else the order of the op we inserted before.
         let ordafter: uintm = match before {
             None => {
-                let oa = ordbefore.wadd(0x1000000);
+                let gap = (uintm::MAX / self.bb_op_len(bl) as uintm).min(0x1000000);
+                let oa = ordbefore.wadd(gap);
                 if oa <= ordbefore {
                     uintm::MAX
                 } else {
@@ -4224,15 +4380,23 @@ impl Funcdata {
     // clear / printRaw (W3-portable / seam-noted)
     // -----------------------------------------------------------------------
 
+    /// The caller-local PPC32 import calls this entry's flow applied.
+    pub fn ppc32_import_calls(&self) -> impl Iterator<Item = &crate::kuna_ppc32piccalls::CallBinding> {
+        self.ppc32_pic_calls.values()
+    }
+
     /// Clear everything associated with decompilation analysis
     /// (C++ `Funcdata::clear`, `funcdata.cc:84`).
     ///
-    /// The W4+ subsystem clears (`localmap->clearUnlocked`, `funcp`,
-    /// `clearActiveOutput`, `unionMap`, `clearCallSpecs`, `clearJumpTables`,
-    /// `heritage.clear`, `covermerge.clear`) are seam-noted; the W3 IR clears
-    /// (`clearBlocks`, `obank.clear`, `vbank.clear`) and the flag/index reset are
-    /// faithful.
+    /// Like upstream, the local scope keeps only the symbols the function was
+    /// given (type-locked, equates, asserted identities) and the prototype only
+    /// its locked parts, so a restarted analysis starts where a fresh decompile
+    /// does. The W3 IR clears (`clearBlocks`, `obank.clear`, `vbank.clear`) and
+    /// the flag/index reset are faithful. Buffered comments survive, as C++
+    /// comments already in the database survive a restart.
     pub fn clear(&mut self) {
+        self.kuna_atomic_xadds.clear();
+        self.ppc32_pic_calls.clear();
         self.kuna_regnarrow_runs = 0;
         self.kuna_regnarrow_values.clear();
         self.kuna_regnarrow_failed.clear();
@@ -4258,10 +4422,25 @@ impl Funcdata {
         self.kuna_condstmts_hits.clear();
         self.kuna_restart_now = false;
 
-        // localmap->clearUnlocked(); localmap->resetLocalWindow();  -- STUB(W4)
+        // localmap->clearUnlocked(); localmap->resetLocalWindow() (funcdata.cc:95):
+        // a restart re-derives every symbol the analysis recovered, as a fresh
+        // decompile does, instead of finding the previous pass's symbols mapped.
+        let glb = std::rc::Rc::clone(&self.glb);
+        if let Some(lm) = self.localmap.as_mut() {
+            let _ = lm.clear_unlocked(glb.types());
+        }
+        self.reset_local_window();
         // clearActiveOutput() (funcdata.cc): drop the output-trial state.
         self.clear_active_output();
-        // funcp.clearUnlockedOutput();                               -- STUB(W4)
+        // funcp.clearUnlockedOutput() (funcdata.cc:99). Upstream's unlocked
+        // inputs are symbols of the localmap; the port keeps them in the
+        // prototype's own store, so they are cleared here.
+        if self.funcp.has_store() {
+            if let Some(types) = glb.types() {
+                let _ = self.funcp.clear_unlocked_output(types);
+            }
+            self.funcp.clear_unlocked_input();
+        }
         // unionMap.clear() (funcdata.cc:90): drop the union-field resolution cache.
         self.union_map.clear();
         self.stack_write_views.clear();
@@ -4291,6 +4470,9 @@ impl Funcdata {
         // `new HighVariable`s are freed); the W7 high bank is cleared here to
         // mirror that lifecycle.
         self.high_bank.clear();
+        if let Some(merge) = self.covermerge.as_mut() {
+            merge.clear();
+        }
         // (kuna, ghidra Phase 4) The wire symbols are keyed by HighVariableId,
         // so they MUST die with the arena that issued those ids — a restart
         // would otherwise let a rebuilt high inherit another variable's symbol
@@ -4736,7 +4918,9 @@ impl Funcdata {
 
     /// C++ `Varnode::findSubpieceShadow` (`varnode.cc:1025-1072`): does `vn`
     /// equal `whole` truncated by `least_byte` least-significant bytes, allowing
-    /// COPY/MULTIEQUAL in the flow path (bounded recursion depth 1).
+    /// COPY/MULTIEQUAL in the flow path (bounded recursion depth 1).  A constant
+    /// `whole` wider than 8 bytes holds zero above bit 63, so a truncation of 8
+    /// or more bytes reads 0 (the C++ shift is undefined there).
     fn find_subpiece_shadow(&self, vn: VarnodeId, least_byte: int4, whole: VarnodeId, recurse: int4) -> bool {
         let vn = self.skip_copy_chain(vn);
         let v = match self.vbank.get(vn) {
@@ -4753,7 +4937,7 @@ impl Funcdata {
                 if !wv.get_addr().is_constant() {
                     return false;
                 }
-                let off = (wv.get_offset() >> (least_byte * 8))
+                let off = wv.get_offset().checked_shr(least_byte as u32 * 8).unwrap_or(0)
                     & kuna_base::address::calc_mask(v.get_size());
                 return off == v.get_offset();
             }
@@ -5084,6 +5268,11 @@ impl Funcdata {
             }
             None => (1, OpCode::CPUI_COPY),
         };
+        if opc == OpCode::CPUI_CALLOTHER {
+            if let Some(ty) = crate::kuna_octeoneffects::output_type(self, op) {
+                return ty;
+            }
+        }
         if let Some(tlst) = self.get_arch().types() {
             if let Ok(ct) = crate::typeop::type_op_info(opc).get_output_local(tlst, sz) {
                 return ct;
@@ -5105,6 +5294,11 @@ impl Funcdata {
             }
             None => (1, OpCode::CPUI_COPY),
         };
+        if opc == OpCode::CPUI_CALLOTHER {
+            if let Some(ty) = crate::kuna_octeoneffects::input_type(self, op, slot) {
+                return ty;
+            }
+        }
         if let Some(tlst) = self.get_arch().types() {
             if let Ok(ct) = crate::typeop::type_op_info(opc).get_input_local(tlst, slot, sz) {
                 return ct;
@@ -5964,6 +6158,149 @@ impl Funcdata {
 /// A field-split read view used by [`Funcdata::with_high_split`]: implements
 /// [`HighContext`] borrowing only `vbank`/`obank`, so the sibling `high_bank`
 /// field stays mutably borrowable.
+impl Funcdata {
+    /// (kuna `sitetypelock`) Is the SSA value produced at `out` never joined
+    /// with a value not derived from it? A per-site output lock is honest only
+    /// then: if `out`'s value reaches a MULTIEQUAL alongside a foreign input (a
+    /// parameter, global, different allocation, or LOAD), the forced type would
+    /// propagate across the phi and mislabel the merged variable — so the
+    /// client refuses such a site rather than lock it. High-independent: it
+    /// reads the def-use graph, which is in SSA form by type-recovery time.
+    pub(crate) fn site_value_is_pure(&self, out: VarnodeId) -> bool {
+        use std::collections::HashSet;
+        // Forward value-carrier set: `out` and everything a COPY/INDIRECT/phi
+        // forwards its value to.
+        let mut carriers: HashSet<VarnodeId> = HashSet::new();
+        carriers.insert(out);
+        let mut work = vec![out];
+        let mut phis: Vec<OpId> = Vec::new();
+        let mut guard = 0u32;
+        while let Some(x) = work.pop() {
+            guard += 1;
+            if guard > 8192 {
+                return false; // pathological graph — refuse conservatively
+            }
+            let Some(v) = self.vbank.get(x) else { continue };
+            for op in v.descend_iter() {
+                let Some(o) = self.obank.get(op) else { continue };
+                match o.code() {
+                    OpCode::CPUI_COPY | OpCode::CPUI_INDIRECT => {
+                        if o.get_in(0) == Some(x) {
+                            if let Some(out2) = o.get_out() {
+                                if carriers.insert(out2) {
+                                    work.push(out2);
+                                }
+                            }
+                        }
+                    }
+                    OpCode::CPUI_MULTIEQUAL => {
+                        phis.push(op);
+                        if let Some(out2) = o.get_out() {
+                            if carriers.insert(out2) {
+                                work.push(out2);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Every phi that carries `out`'s value must take ALL its inputs from
+        // values derived from `out`; a foreign sibling input makes the join
+        // ambiguous.
+        let mut memo = std::collections::HashMap::new();
+        for op in phis {
+            let Some(o) = self.obank.get(op) else { continue };
+            for k in 0..o.num_input() {
+                if let Some(ik) = o.get_in(k) {
+                    if !derives_from_banks(&self.vbank, &self.obank, ik, out, &mut memo, 0) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+}
+
+/// (kuna `sitetypelock`) Does the HighVariable with members `insts` hold a
+/// member foreign to the per-call-site lock on `lock_vn`? A member is foreign
+/// when it is wider than the lock, or does not reach `lock_vn` through only
+/// same-value edges ([`derives_from_banks`]). Shared by the two `HighContext`
+/// bank views so `get_type_representative` can demote a dishonest site lock.
+pub(crate) fn high_has_foreign_member_banks(
+    vbank: &VarnodeBank,
+    obank: &PcodeOpBank,
+    insts: &[VarnodeId],
+    lock_vn: VarnodeId,
+    lock_size: int4,
+) -> bool {
+    let mut memo: std::collections::HashMap<VarnodeId, bool> = std::collections::HashMap::new();
+    for &m in insts {
+        if m == lock_vn {
+            continue;
+        }
+        if vbank.get(m).map(|mv| mv.get_size() > lock_size).unwrap_or(true) {
+            return true;
+        }
+        if !derives_from_banks(vbank, obank, m, lock_vn, &mut memo, 0) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The longest same-value chain [`derives_from_banks`] walks before reporting
+/// foreign — copy/phi chains in allocation flow are short; the bound only
+/// stops a pathological cycle.
+const SITE_DERIVE_DEPTH_CAP: u32 = 48;
+
+/// `true` when `n` is `src` or reaches it through only same-value edges: a
+/// COPY/INDIRECT of a deriving value, or a MULTIEQUAL every input of which
+/// derives. An input/constant/global, a different call output, a LOAD, or a
+/// phi mixing such a value in is NOT deriving.
+fn derives_from_banks(
+    vbank: &VarnodeBank,
+    obank: &PcodeOpBank,
+    n: VarnodeId,
+    src: VarnodeId,
+    memo: &mut std::collections::HashMap<VarnodeId, bool>,
+    depth: u32,
+) -> bool {
+    if n == src {
+        return true;
+    }
+    if depth > SITE_DERIVE_DEPTH_CAP {
+        return false;
+    }
+    if let Some(&b) = memo.get(&n) {
+        return b;
+    }
+    memo.insert(n, false); // cycle guard: a value on the recursion stack is foreign
+    let res = (|| {
+        let v = vbank.get(n)?;
+        if v.is_constant() || v.is_input() || !v.is_written() {
+            return Some(false);
+        }
+        let o = obank.get(v.get_def()?)?;
+        Some(match o.code() {
+            OpCode::CPUI_COPY | OpCode::CPUI_INDIRECT => o
+                .get_in(0)
+                .map(|i0| derives_from_banks(vbank, obank, i0, src, memo, depth + 1))
+                .unwrap_or(false),
+            OpCode::CPUI_MULTIEQUAL => (0..o.num_input()).all(|k| {
+                o.get_in(k)
+                    .map(|ik| derives_from_banks(vbank, obank, ik, src, memo, depth + 1))
+                    .unwrap_or(false)
+            }),
+            _ => false,
+        })
+    })()
+    .unwrap_or(false);
+    memo.insert(n, res);
+    res
+}
+
 pub(crate) struct HighReadView<'a> {
     vbank: &'a VarnodeBank,
     obank: &'a PcodeOpBank,
@@ -5978,6 +6315,14 @@ impl<'a> HighReadView<'a> {
 }
 
 impl<'a> HighContext for HighReadView<'a> {
+    fn high_has_foreign_member(
+        &self,
+        insts: &[VarnodeId],
+        lock_vn: VarnodeId,
+        lock_size: int4,
+    ) -> bool {
+        high_has_foreign_member_banks(self.vbank, self.obank, insts, lock_vn, lock_size)
+    }
     fn vn_view(&self, vn: VarnodeId) -> VarnodeView {
         let v = self.vbank.get(vn).expect("vn_view: stale vn");
         let space_internal = v
@@ -5995,6 +6340,7 @@ impl<'a> HighContext for HighReadView<'a> {
             size: v.get_size(),
             type_: std::rc::Rc::clone(v.get_type()),
             type_lock: v.is_type_lock(),
+            site_locked: v.is_site_locked(),
             merge_group: v.get_merge_group(),
             written: v.is_written(),
             def_time,
@@ -6303,14 +6649,14 @@ mod tests {
         let mut fd = build_fd();
         let (block, _) = make_block_with_ops(&mut fd, 1);
         let start = fd.affecting_ops_revision();
-        for i in 0..20_000u64 {
+        for i in 0..200_000u64 {
             let op = fd.obank.create_at(1, Address::new(ram_space(&fd), 0x2000 + i));
             fd.obank.change_opcode(op, TypeOp::new(OpCode::CPUI_COPY, 0, "COPY"));
             fd.bb_insert_op(op, block, None);
         }
         assert_strict_block_order(&fd, block);
         let renumbers = fd.affecting_ops_revision() - start;
-        assert!(renumbers <= 100, "{renumbers} renumbers");
+        assert!(renumbers <= 16, "{renumbers} renumbers");
     }
 
     #[test]
@@ -6691,5 +7037,23 @@ mod tests {
         fd.clear_covermerge();
         let third = fd.with_covermerge(|merge, _data| merge.copy_trims_len());
         assert_eq!(third, 0);
+    }
+
+    /// Kuna #1674: a constant wider than 8 bytes holds zero above bit 63, so a
+    /// piece 8 or more bytes into it shadows only the constant 0.
+    #[test]
+    fn partial_copy_shadow_reads_zero_above_bit_63_of_a_wide_constant() {
+        let mut fd = build_fd();
+        let zero16 = fd.new_constant(16, 0);
+        let low16 = fd.new_constant(16, 0x1234);
+        let zero8 = fd.new_constant(8, 0);
+        let low8 = fd.new_constant(8, 0x1234);
+        let zero4 = fd.new_constant(4, 0);
+        assert!(fd.varnode_partial_copy_shadow(low8, low16, 0));
+        assert!(fd.varnode_partial_copy_shadow(zero8, zero16, 8));
+        assert!(fd.varnode_partial_copy_shadow(zero8, low16, 8));
+        assert!(fd.varnode_partial_copy_shadow(zero4, low16, 12));
+        assert!(!fd.varnode_partial_copy_shadow(low8, low16, 8));
+        assert!(!fd.varnode_partial_copy_shadow(low8, zero16, 8));
     }
 }

@@ -196,6 +196,8 @@ pub mod modifiers {
     /// under `option truthycond` (DIV-36).  Scoped off across any
     /// non-boolean-preserving operator by `op_push_ir`.
     pub const CONDITION_CONTEXT: uint4 = 0x10000;
+    /// Take a raw address when Rust emits an indexed STORE operand.
+    pub(crate) const RUST_RAW_INDEX_ADDRESS: uint4 = 0x20000;
 }
 
 /// Possible types of [`Atom`] (C++ `PrintLanguage::tagtype`,
@@ -220,6 +222,8 @@ pub enum TagType {
     CaseToken,
     /// For anonymous types.
     BlankToken,
+    /// A constructed expression, with variable provenance and final language spelling.
+    LiteralToken,
 }
 
 /// Strategies for displaying namespace tokens (C++

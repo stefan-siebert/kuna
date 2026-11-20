@@ -1,7 +1,7 @@
 //! JSON layout and ASCII-safe escaping shared by all CLI output modes.
 
 use super::Json;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Format {
@@ -14,6 +14,58 @@ pub(super) fn render(value: &Json, format: Format) -> String {
     let mut out = String::new();
     write_value(&mut out, value, 0, format);
     out
+}
+
+/// How much of a streamed document is buffered before it is written.
+const STREAM_CHUNK: usize = 1 << 16;
+
+/// [`super::write_indent2_streamed`].
+pub(super) fn write_streamed(
+    out: &mut dyn std::io::Write,
+    head: &[(String, Json)],
+    key: &str,
+    items: impl Iterator<Item = Json>,
+    tail: &[(String, Json)],
+) -> std::io::Result<()> {
+    let field = |buf: &mut String, first: bool, name: &str| {
+        if !first {
+            buf.push(',');
+        }
+        Format::Pretty.line(buf, 2);
+        write_string(buf, name);
+        buf.push_str(": ");
+    };
+    let mut buf = String::from("{");
+    for (i, (name, value)) in head.iter().enumerate() {
+        field(&mut buf, i == 0, name);
+        write_value(&mut buf, value, 2, Format::Pretty);
+    }
+    field(&mut buf, head.is_empty(), key);
+    buf.push('[');
+    let mut any = false;
+    for item in items {
+        if any {
+            buf.push(',');
+        }
+        any = true;
+        Format::Pretty.line(&mut buf, 4);
+        write_value(&mut buf, &item, 4, Format::Pretty);
+        if buf.len() >= STREAM_CHUNK {
+            out.write_all(buf.as_bytes())?;
+            buf.clear();
+        }
+    }
+    if any {
+        Format::Pretty.line(&mut buf, 2);
+    }
+    buf.push(']');
+    for (name, value) in tail {
+        field(&mut buf, false, name);
+        write_value(&mut buf, value, 2, Format::Pretty);
+    }
+    Format::Pretty.line(&mut buf, 0);
+    buf.push('}');
+    out.write_all(buf.as_bytes())
 }
 
 impl Format {
@@ -86,6 +138,23 @@ fn write_pairs<'a>(
     out.push('}');
 }
 
+/// JSON Unicode escapes, shared by string and I/O renderers.
+pub(crate) struct UnicodeEscape(pub(crate) char);
+
+impl fmt::Display for UnicodeEscape {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cp = self.0 as u32;
+        if cp <= 0xFFFF {
+            write!(out, "\\u{cp:04x}")
+        } else {
+            let v = cp - 0x10000;
+            let hi = 0xD800 + (v >> 10);
+            let lo = 0xDC00 + (v & 0x3FF);
+            write!(out, "\\u{hi:04x}\\u{lo:04x}")
+        }
+    }
+}
+
 fn write_string(out: &mut String, s: &str) {
     out.push('"');
     for ch in s.chars() {
@@ -98,20 +167,11 @@ fn write_string(out: &mut String, s: &str) {
             '\u{0008}' => out.push_str("\\b"),
             '\u{000C}' => out.push_str("\\f"),
             c if (c as u32) < 0x20 => {
-                let _ = write!(out, "\\u{:04x}", c as u32);
+                let _ = write!(out, "{}", UnicodeEscape(c));
             }
             c if (c as u32) < 0x7F => out.push(c),
             c => {
-                // ensure_ascii: emit \uXXXX (surrogate pair for astral planes).
-                let cp = c as u32;
-                if cp <= 0xFFFF {
-                    let _ = write!(out, "\\u{:04x}", cp);
-                } else {
-                    let v = cp - 0x10000;
-                    let hi = 0xD800 + (v >> 10);
-                    let lo = 0xDC00 + (v & 0x3FF);
-                    let _ = write!(out, "\\u{:04x}\\u{:04x}", hi, lo);
-                }
+                let _ = write!(out, "{}", UnicodeEscape(c));
             }
         }
     }

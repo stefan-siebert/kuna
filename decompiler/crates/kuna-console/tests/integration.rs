@@ -1,6 +1,9 @@
 // Shared integration-test executable. Process-sensitive tests stay separate.
 mod common;
 
+#[path = "verify_goextensions.rs"]
+mod verify_goextensions;
+
 #[path = "verify_gobyteextract.rs"]
 mod verify_gobyteextract;
 
@@ -11,11 +14,20 @@ mod verify_gobyteview;
 mod octeon_n64_arguments;
 #[path = "octeon_abi.rs"]
 mod octeon_abi;
+#[path = "mips_import_flow.rs"]
+mod mips_import_flow;
+#[path = "octeon_atomics.rs"]
+mod octeon_atomics;
 #[path = "n32_stack.rs"]
 mod n32_stack;
 
 #[path = "setup_commands.rs"]
 mod setup_commands;
+
+#[path = "verify_language_database.rs"]
+mod verify_language_database;
+#[path = "verify_memoryspecs.rs"]
+mod verify_memoryspecs;
 
 #[path = "verify_aarch64_plt.rs"]
 mod verify_aarch64_plt;
@@ -31,6 +43,9 @@ mod verify_aifpoolslide;
 
 #[path = "verify_aifstrict.rs"]
 mod verify_aifstrict;
+
+#[path = "verify_armderef.rs"]
+mod verify_armderef;
 
 #[path = "verify_arm_context.rs"]
 mod verify_arm_context;
@@ -59,11 +74,12 @@ mod verify_assertplane;
 #[path = "verify_assertranges.rs"]
 mod verify_assertranges;
 
+#[path = "verify_branchtable.rs"]
+mod verify_branchtable;
+
 #[path = "verify_buildstamp.rs"]
 mod verify_buildstamp;
 
-#[path = "verify_bytehonest.rs"]
-mod verify_bytehonest;
 
 #[path = "verify_lazyfuncs.rs"]
 mod verify_lazyfuncs;
@@ -91,6 +107,11 @@ mod verify_cppcallnames;
 
 #[path = "verify_cppproto.rs"]
 mod verify_cppproto;
+#[path = "verify_funcptrnames.rs"]
+mod verify_funcptrnames;
+
+#[path = "verify_dwarf_namespaces.rs"]
+mod verify_dwarf_namespaces;
 
 #[path = "verify_cppsig.rs"]
 mod verify_cppsig;
@@ -179,8 +200,6 @@ mod verify_flowreuse;
 #[path = "verify_formatstring_crossarch.rs"]
 mod verify_formatstring_crossarch;
 
-#[path = "verify_framelayout.rs"]
-mod verify_framelayout;
 
 #[path = "verify_funcbounds.rs"]
 mod verify_funcbounds;
@@ -197,6 +216,8 @@ mod verify_go_pclntab;
 mod verify_go_noreturn_stripped;
 #[path = "verify_go_morestack.rs"]
 mod verify_go_morestack;
+#[path = "verify_go_mcall.rs"]
+mod verify_go_mcall;
 #[path = "verify_fatstr_records.rs"]
 mod verify_fatstr_records;
 #[path = "verify_go_writebarrier.rs"]
@@ -218,6 +239,9 @@ mod verify_iatcall;
 
 #[path = "verify_indirect_callers.rs"]
 mod verify_indirect_callers;
+
+#[path = "verify_itaniumctors.rs"]
+mod verify_itaniumctors;
 
 #[path = "verify_itaniumrtti.rs"]
 mod verify_itaniumrtti;
@@ -264,6 +288,9 @@ mod verify_macho_imports;
 #[path = "verify_machomain.rs"]
 mod verify_machomain;
 
+#[path = "verify_unwindstarts.rs"]
+mod verify_unwindstarts;
+
 #[path = "verify_mappedflowboundary.rs"]
 mod verify_mappedflowboundary;
 
@@ -308,6 +335,21 @@ mod verify_noreturn_propagate;
 
 #[path = "verify_objc.rs"]
 mod verify_objc;
+#[path = "verify_swiftmetadata.rs"]
+mod verify_swiftmetadata;
+#[path = "verify_swifttypes.rs"]
+mod verify_swifttypes;
+#[path = "verify_swiftcall.rs"]
+mod verify_swiftcall;
+
+#[path = "verify_importdata.rs"]
+mod verify_importdata;
+
+#[path = "verify_cfstring.rs"]
+mod verify_cfstring;
+
+#[path = "verify_elfgotimports.rs"]
+mod verify_elfgotimports;
 
 #[path = "verify_object_formats.rs"]
 mod verify_object_formats;
@@ -350,6 +392,9 @@ mod verify_ppc64_plt;
 
 #[path = "verify_ppclocalentry.rs"]
 mod verify_ppclocalentry;
+
+#[path = "verify_predjump.rs"]
+mod verify_predjump;
 
 #[path = "verify_ptrarray_declarators.rs"]
 mod verify_ptrarray_declarators;
@@ -399,8 +444,6 @@ mod verify_sectionlessextent;
 #[path = "verify_short_utf16_window.rs"]
 mod verify_short_utf16_window;
 
-#[path = "verify_slotptr.rs"]
-mod verify_slotptr;
 
 #[path = "verify_sparc_plt.rs"]
 mod verify_sparc_plt;
@@ -453,6 +496,9 @@ mod verify_w11_elf_plt_names;
 #[path = "verify_widestrings.rs"]
 mod verify_widestrings;
 
+#[path = "verify_xreffp.rs"]
+mod verify_xreffp;
+
 #[path = "wrapped_stack_encode.rs"]
 mod wrapped_stack_encode;
 
@@ -476,8 +522,48 @@ mod verify_rustfmtflags;
 
 #[path = "verify_rustfmtresult.rs"]
 mod verify_rustfmtresult;
+
+#[path = "verify_rustfmtpanic.rs"]
+mod verify_rustfmtpanic;
+
+#[path = "verify_rustfmtpieces.rs"]
+mod verify_rustfmtpieces;
 #[path = "verify_outlang_go.rs"]
 mod verify_outlang_go;
 
 #[path = "verify_godwarfsig.rs"]
 mod verify_godwarfsig;
+#[path = "verify_gopairreturns.rs"]
+mod verify_gopairreturns;
+#[path = "verify_gointerror.rs"]
+mod verify_gointerror;
+
+#[path = "verify_rustextensions.rs"]
+mod verify_rustextensions;
+#[path = "verify_rustuserop.rs"]
+mod verify_rustuserop;
+
+#[path = "verify_rustsigned.rs"]
+mod verify_rustsigned;
+
+#[path = "verify_rustfmtstr.rs"]
+mod verify_rustfmtstr;
+#[path = "verify_rustfmtwrite.rs"]
+mod verify_rustfmtwrite;
+#[path = "verify_rustfmtio.rs"]
+mod verify_rustfmtio;
+
+#[path = "verify_rustprobestack.rs"]
+mod verify_rustprobestack;
+
+#[path = "verify_bootstrap.rs"]
+mod verify_bootstrap;
+
+#[path = "mips_weak_imports.rs"]
+mod mips_weak_imports;
+
+#[path = "indirect_dispatch_flow.rs"]
+mod indirect_dispatch_flow;
+
+#[path = "verify_immutable_got.rs"]
+mod verify_immutable_got;

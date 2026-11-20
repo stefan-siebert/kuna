@@ -31,8 +31,11 @@ impl Funcdata {
     /// unknown-base [`Datatype`] skeleton directly (size `s`, metatype
     /// `TYPE_UNKNOWN`), exactly as the merged `funcdata.rs`/`varnode.rs` tests do.
     /// W6 replaces this with the interned-factory lookup; call sites stay put.
-    fn type_base_unknown(s: int4) -> Rc<Datatype> {
-        Rc::new(Datatype::new(s, type_metatype::TYPE_UNKNOWN))
+    ///
+    /// The skeleton is allocated by the Varnode when its type is first read
+    /// ([`crate::varnode::unknown_skeleton`]); `s` is always the new Varnode's size.
+    fn type_base_unknown(_s: int4) -> Rc<Datatype> {
+        crate::varnode::unknown_skeleton()
     }
 
     /// Materialize the function's recovered/locked input parameters as Symbols in
@@ -218,7 +221,7 @@ impl Funcdata {
                         v.is_type_lock(),
                         v.is_spacebase(),
                         v.get_size(),
-                        v.get_type().get_metatype() == type_metatype::TYPE_BOOL,
+                        v.is_type_lock() && v.get_type().get_metatype() == type_metatype::TYPE_BOOL,
                         v.get_def(),
                     )
                 };
@@ -282,6 +285,9 @@ impl Funcdata {
         let ct = Self::type_base_unknown(s);
         let caddr = self.get_arch().get_constant(constant_val);
         let vn = self.vbank_mut().create(s, caddr, ct);
+        if self.get_arch().nullable_literal_values.contains(&constant_val) {
+            self.vbank_mut().get_mut(vn).unwrap().set_synthetic_literal(true);
+        }
         self.assign_high(vn);
         vn
     }
@@ -313,14 +319,28 @@ impl Funcdata {
     /// entry, so [`Funcdata::set_varnode_properties`] (the merged `funcdata.rs`
     /// W4 no-op) is called instead, preserving the call cadence.
     pub fn new_varnode(&mut self, s: int4, m: &Address, ct: Option<Rc<Datatype>>) -> VarnodeId {
+        let index = self.vbank_mut().reserve_create_index(1);
+        self.new_varnode_at(s, m, ct, index)
+    }
+
+    /// [`Funcdata::new_varnode`] of the unknown type with a creation index taken
+    /// earlier by [`VarnodeBank::reserve_create_index`].
+    pub fn new_varnode_reserved(&mut self, s: int4, m: &Address, index: uint4) -> VarnodeId {
+        self.new_varnode_at(s, m, None, index)
+    }
+
+    fn new_varnode_at(&mut self, s: int4, m: &Address, ct: Option<Rc<Datatype>>, index: uint4) -> VarnodeId {
         let ct = ct.unwrap_or_else(|| Self::type_base_unknown(s));
-        let vn = self.vbank_mut().create(s, m.clone(), ct);
+        let vn = self.vbank_mut().create_reserved(s, m.clone(), ct, index);
         self.assign_high(vn);
         if s >= self.get_min_laned_size() {
             self.check_for_laned_register(s, m);
         }
         // uint4 vflags=0; entry = localmap->queryProperties(...); ...  -- STUB(W4)
         self.set_varnode_properties(vn);
+        if m.is_constant() && self.get_arch().nullable_literal_values.contains(&m.get_offset()) {
+            self.vbank_mut().get_mut(vn).unwrap().set_synthetic_literal(true);
+        }
         vn
     }
 
@@ -560,7 +580,13 @@ impl Funcdata {
         self.varnode_out(s, m, op, false)
     }
 
+    /// (kuna) Constant zero is where a slice of an ABI join's padding piece
+    /// renormalizes: it has no storage, so the output gets a temporary instead.
+    /// Any other constant address keeps upstream's "Assignment to constant".
     fn varnode_out(&mut self, s: int4, m: &Address, op: OpId, laned: bool) -> KunaResult<VarnodeId> {
+        if m.is_constant() && m.get_offset() == 0 {
+            return self.unique_out(s, op, laned);
+        }
         let ct = Self::type_base_unknown(s);
         // Split-borrow: the thunk (holds &mut obank) drops before later &mut self calls.
         let def = self.def_op_info_v(op);
@@ -631,6 +657,9 @@ impl Funcdata {
         let ct = Self::type_base_unknown(1);
         let vn = self.vbank_mut().create(1, m.clone(), ct);
         self.vbank_mut().get_mut(vn).expect("new_code_ref: stale vn").set_annotation();
+        if self.get_arch().nullable_literal_values.contains(&m.get_offset()) {
+            self.vbank_mut().get_mut(vn).unwrap().set_synthetic_literal(true);
+        }
         self.assign_high(vn);
         vn
     }
@@ -798,6 +827,7 @@ impl Funcdata {
             (v.get_size(), v.get_addr().clone(), Rc::clone(v.get_type()), v.get_flags())
         };
         let cloned = self.clone_varnode_fields(size, addr, ct, flags);
+        if self.vbank().get(vn).unwrap().is_synthetic_literal() { self.vbank_mut().get_mut(cloned).unwrap().set_synthetic_literal(true); }
         let transport = self.kuna_is_call_transport(vn);
         self.kuna_inherit_storage(cloned, vn);
         if transport {
@@ -817,6 +847,7 @@ impl Funcdata {
             (v.get_size(), v.get_addr().clone(), Rc::clone(v.get_type()), v.get_flags())
         };
         let cloned = self.clone_varnode_fields(size, addr, ct, flags);
+        if src.vbank().get(vn).unwrap().is_synthetic_literal() { self.vbank_mut().get_mut(cloned).unwrap().set_synthetic_literal(true); }
         self.kuna_extend_storage_sources(cloned, src.kuna_storage_sources(vn).iter().cloned());
         if src.kuna_is_call_transport(vn) {
             self.kuna_mark_call_transport(cloned);
@@ -1125,7 +1156,7 @@ impl Funcdata {
     /// takes.  Shared by [`link_symbol_reference`] (the attach) and
     /// [`name_undefined_spacebase_symbols`] (the namerec rename pre-pass) so the two
     /// passes resolve the identical address.
-    fn resolve_spacebase_ref_addr(&mut self, off_vn: VarnodeId) -> Option<Address> {
+    pub(crate) fn resolve_spacebase_ref_addr(&self, off_vn: VarnodeId) -> Option<Address> {
         // The PTRSUB this constant feeds.
         let op = self.lone_descend(off_vn)?;
         // The spacebase varnode.
@@ -2157,6 +2188,11 @@ impl Funcdata {
 
         if fc.is_input_active() {
             let curtrial = fc.active_input().get_trial_for_input_varnode(j);
+            // (kuna `calleereginputs`) A register the other callee reads is that
+            // call's own argument, so this use is not explained away by it.
+            if crate::p4_calls::kuna_calleereginputs::reads_register(fc, curtrial.get_address(), curtrial.get_size()) {
+                return true;
+            }
             if curtrial.is_checked() {
                 if curtrial.is_active() {
                     // (kuna) `varargsharedfloat`: see
@@ -2168,7 +2204,8 @@ impl Funcdata {
             }
             return true;
         }
-        false
+        // (kuna) `sharedpush`: see [`crate::p4_calls::kuna_sharedpush`].
+        crate::p4_calls::kuna_sharedpush::declared_arm_shares(self, opmatch, op, vn, trial)
     }
 
     /// Test if the given Varnode seems to only be used by `opmatch` as a
@@ -2223,6 +2260,7 @@ impl Funcdata {
         varlist.push((invn, main_flags, None));
         let active_output = self.get_active_output().is_some();
         let forced_return = crate::p4_calls::kuna_voidret::scoring_return(self, opmatch);
+        let call_return = crate::p4_calls::kuna_exclusivecallret::applies(self, opmatch, trial);
         let mut reached_match = false;
         let mut i = 0;
         while i < varlist.len() {
@@ -2240,8 +2278,8 @@ impl Funcdata {
                 if forced.is_some_and(|f| retest::cannot_arrive(self, f, op, &mut reach)) {
                     continue;
                 }
-                // (kuna) `zeroidiomuse` — an `INT_XOR`/`INT_SUB` of a value with
-                // itself is `0` whatever the value is, so it neither observes the
+                // (kuna) An `INT_XOR`/`INT_SUB` of a value with itself is `0`
+                // whatever the value is, so it neither observes the
                 // Varnode nor carries it onward.  See
                 // [`crate::p4_calls::kuna_zeroidiomuse`].
                 if crate::p4_calls::kuna_zeroidiomuse::op_discards_operand(self, op) {
@@ -2264,6 +2302,10 @@ impl Funcdata {
                     }
                 }
                 let mut cur_flags = base_flags;
+                // (kuna) `exclusivecallret` — see [`crate::p4_calls::kuna_exclusivecallret`].
+                if call_return && crate::p4_calls::kuna_exclusivecallret::skips_use(self, opmatch, op, invn, vn) {
+                    continue;
+                }
                 match code {
                     OpCode::CPUI_BRANCH
                     | OpCode::CPUI_CBRANCH
@@ -3408,7 +3450,7 @@ impl AncestorRealistic {
 /// slotmap key's bit pattern is used.  `slotmap` keys expose their packed `u64`
 /// form via `KeyData::as_ffi`; the round-trip is opaque to the IR (the iop-space
 /// value is only ever decoded back to identify the same op).
-fn op_iop_encode(op: OpId) -> uintb {
+pub(crate) fn op_iop_encode(op: OpId) -> uintb {
     use slotmap::Key;
     op.data().as_ffi()
 }
@@ -3578,6 +3620,32 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_import_literals_survive_all_constructors_and_clones() {
+        let mut context = ArchContext::new(build_manager());
+        context.nullable_literal_values = Rc::new([0x402000].into_iter().collect());
+        let ram = context.manage().get_space_by_name("ram").unwrap().clone();
+        let address = Address::new(ram.clone(), 0x1000);
+        let mut fd = Funcdata::new("literal", "literal", Rc::new(context), address,
+            0x10000000, 0x40).unwrap();
+        let constant_address = fd.get_arch().get_constant(0x402000);
+        let a = fd.new_constant(8, 0x402000);
+        let b = fd.new_varnode(8, &constant_address, None);
+        let c = fd.new_code_ref(&Address::new(ram, 0x402000));
+        for original in [a, b, c] {
+            assert!(fd.vbank().get(original).unwrap().is_synthetic_literal());
+            let cloned = fd.clone_varnode(original);
+            assert!(fd.vbank().get(cloned).unwrap().is_synthetic_literal());
+            let mut other = build_fd();
+            let cloned = other.clone_varnode_from(&fd, original);
+            assert!(other.vbank().get(cloned).unwrap().is_synthetic_literal());
+        }
+        let ordinary = fd.new_constant(8, 0x403000);
+        assert!(!fd.vbank().get(ordinary).unwrap().is_synthetic_literal());
+        fd.vbank_mut().get_mut(c).unwrap().set_synthetic_literal(false);
+        assert!(!fd.vbank().get(c).unwrap().is_synthetic_literal());
+    }
+
+    #[test]
     fn new_unique_advances_uniq_offset_and_create_index() {
         let mut fd = build_fd();
         let a = fd.new_unique(4, None);
@@ -3626,6 +3694,20 @@ mod tests {
         assert!(Rc::ptr_eq(v.get_space(), iop));
         // The encoded offset round-trips to the same key bit-pattern.
         assert_eq!(v.get_offset(), op_iop_encode(op));
+    }
+
+    #[test]
+    fn an_untyped_varnode_gets_its_own_skeleton_when_first_read() {
+        let mut fd = build_fd();
+        let (a, b, c) = (fd.new_constant(8, 1), fd.new_constant(8, 2), fd.new_constant(4, 3));
+        let ta = Rc::clone(fd.vbank().get(a).unwrap().get_type());
+        assert!(ta.is_unknown_placeholder() && ta.get_size() == 8);
+        assert!(Rc::ptr_eq(&ta, fd.vbank().get(a).unwrap().get_type()), "one skeleton per Varnode");
+        assert!(!Rc::ptr_eq(&ta, fd.vbank().get(b).unwrap().get_type()), "never shared between Varnodes");
+        let factory = unk(4);
+        assert!(fd.vbank_mut().get_mut(c).unwrap().update_type(Rc::clone(&factory)));
+        assert!(Rc::ptr_eq(fd.vbank().get(c).unwrap().get_type(), &factory));
+        assert!(!fd.vbank_mut().get_mut(c).unwrap().update_type(factory));
     }
 
     #[test]
@@ -3982,6 +4064,40 @@ mod tests {
         assert!(fd.kuna_storage_sources(reused).is_empty());
         fd.clear();
         assert!(fd.kuna_storage_sources(second).is_empty());
+    }
+
+    #[test]
+    fn large_storage_merge_preserves_order_and_distinct_write_sites() {
+        use crate::kuna_varsources::StorageSource;
+
+        let mut fd = build_fd();
+        let dst = fd.new_unique(4, None);
+        let ram = ram(&fd);
+        let source = |offset, write: Option<u64>| StorageSource {
+            address: Address::new(Rc::clone(&ram), offset),
+            size: 4,
+            write_address: write.map(|pc| Address::new(Rc::clone(&ram), pc)),
+        };
+        fd.kuna_extend_storage_sources(dst, (0..64).map(|offset| source(offset, None)));
+        fd.kuna_extend_storage_sources(
+            dst,
+            (40..64).map(|offset| source(offset, None)).chain([
+                source(53, Some(0x100)),
+                source(4, Some(0x100)),
+                source(53, Some(0x100)),
+                source(53, Some(0x101)),
+            ]),
+        );
+
+        let mut expected: Vec<_> = (0..64).map(|offset| (offset, None)).collect();
+        expected.extend([(53, Some(0x100)), (4, Some(0x100)), (53, Some(0x101))]);
+        let actual: Vec<_> = fd.kuna_storage_sources(dst).iter().map(|source| {
+            (
+                source.address.get_offset(),
+                source.write_address.as_ref().map(Address::get_offset),
+            )
+        }).collect();
+        assert_eq!(actual, expected);
     }
 
     #[test]

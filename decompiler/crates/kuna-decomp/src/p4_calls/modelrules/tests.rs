@@ -17,7 +17,7 @@ use kuna_base::marshal::{Decoder, IdRegistry, XmlDecode};
 use kuna_base::space::{spacetype, AddrSpace, AddrSpaceManager};
 use kuna_base::types::int4;
 
-use crate::dtype::{type_class, type_metatype, Datatype, DatatypeKind, TypeField, TypeFactory};
+use crate::dtype::{type_class, type_metatype, Datatype, DatatypeKind, TypeBitField, TypeField, TypeFactory};
 use crate::fspec::{
     AssignActionResponse, ParamActive, ParamEntry, ParamListKind, ParamListStandard, ParameterPieces,
     PrototypePieces,
@@ -208,6 +208,45 @@ fn primitive_extractor_struct_with_hole() {
 }
 
 #[test]
+fn primitive_extractor_bitfields_include_only_occupied_bytes() {
+    for big_endian in [false, true] {
+        let mut s = (*dt_struct(4, 4, &[])).clone();
+        let mut bf = TypeBitField::new(0, 16, big_endian, "w", dt_int(4));
+        bf.byte_size = 4;
+        bf.least_sig_bit = 8;
+        s.kind = DatatypeKind::Struct { field: vec![], bitfield: vec![bf.clone(), bf] };
+        let p = PrimitiveExtractor::new(&Rc::new(s), false, 0, 2);
+        assert!(p.is_valid() && p.is_aligned() && !p.contains_unknown());
+        assert_eq!(p.size(), 2);
+        assert_eq!(p.get(0).offset, 1);
+        assert_eq!(p.get(1).offset, 2);
+        assert_eq!(p.get(0).dt.get_size(), 1);
+        assert_eq!(p.get(1).dt.get_metatype(), type_metatype::TYPE_UINT);
+    }
+}
+
+#[test]
+fn primitive_extractor_bitfields_keep_mixed_float_and_member_alignment() {
+    let mut s = (*dt_struct(16, 8, &[(8, dt_float(8))])).clone();
+    let DatatypeKind::Struct { bitfield, .. } = &mut s.kind else { unreachable!() };
+    bitfield.push(TypeBitField::new(0, 16, false, "w", dt_int(2)));
+    let p = PrimitiveExtractor::new(&Rc::new(s), false, 0, 16);
+    assert!(p.is_valid() && p.is_aligned() && !p.contains_holes());
+    assert_eq!(p.size(), 2);
+    assert_eq!(p.get(0).dt.get_metatype(), type_metatype::TYPE_UINT);
+    assert_eq!(p.get(0).dt.get_size(), 2);
+    assert_eq!(p.get(1).offset, 8);
+    assert_eq!(p.get(1).dt.get_metatype(), type_metatype::TYPE_FLOAT);
+
+    let mut packed = (*dt_struct(5, 1, &[(1, dt_float(4))])).clone();
+    let DatatypeKind::Struct { bitfield, .. } = &mut packed.kind else { unreachable!() };
+    bitfield.push(TypeBitField::new(0, 3, false, "b", dt_int(4)));
+    let p = PrimitiveExtractor::new(&Rc::new(packed), false, 0, 16);
+    assert!(p.is_valid());
+    assert!(!p.is_aligned());
+}
+
+#[test]
 fn primitive_extractor_max_exceeded_invalid() {
     // An array of 5 ints with max 4 -> invalid (extraction gives up).
     let arr = dt_array(dt_int(4), 5);
@@ -317,6 +356,40 @@ fn filter_homogeneous_float_aggregate() {
     assert!(!f.filter(&mixed));
     // A scalar float is not an aggregate (must be ARRAY or STRUCT).
     assert!(!f.filter(&dt_float(4)));
+}
+
+#[test]
+fn direct_float_struct_filter_keeps_field_identity_offsets_and_size_limits() {
+    let filter = DatatypeFilter::FloatFields { max_primitives: 2, size: SizeRestriction::new(1, 16) };
+    for fields in [vec![(0, dt_float(4)), (8, dt_float(8))], vec![(0, dt_float(8)), (8, dt_float(4))]] {
+        assert!(filter.filter(&dt_struct(16, 8, &fields)));
+    }
+    assert!(filter.filter(&dt_struct(16, 16, &[(0, dt_float(4))])));
+    assert!(filter.filter(&dt_struct(16, 16, &[(0, dt_float(16))])));
+    let mut with_bits = (*dt_struct(16, 8, &[(0, dt_float(8))])).clone();
+    with_bits.flags |= crate::dtype::flags::has_bitfields;
+    if let DatatypeKind::Struct { bitfield, .. } = &mut with_bits.kind {
+        let mut bit = crate::dtype::TypeBitField::new(1, 1, true, "b", dt_int(4));
+        bit.byte_offset = 8;
+        bitfield.push(bit);
+    }
+    let with_bits = Rc::new(with_bits);
+    assert!(!filter.filter(&with_bits));
+    assert!(super::super::kuna_aggregateabi::direct_fields(&with_bits).is_some(),
+        "integer bitfields must not discard a separate direct floating argument field");
+    for rejected in [
+        dt_float(8), dt_array(dt_float(8), 1), dt_union(8, 8, &[dt_float(8)]),
+        dt_struct(8, 8, &[(0, dt_struct(8, 8, &[(0, dt_float(8))]))]),
+        dt_struct(8, 8, &[(0, dt_array(dt_float(8), 1))]),
+        dt_struct(16, 8, &[(0, dt_float(8)), (8, dt_int(8))]),
+        dt_struct(12, 4, &[(0, dt_float(4)), (4, dt_float(4)), (8, dt_float(4))]),
+        dt_struct(32, 16, &[(0, dt_float(16)), (16, dt_float(16))]),
+        dt_struct(8, 8, &[(4, dt_float(8))]),
+        dt_struct(8, 4, &[(0, dt_float(4)), (2, dt_float(4))]),
+        dt_struct(0, 1, &[]),
+    ] {
+        assert!(!filter.filter(&rejected), "{rejected:?}");
+    }
 }
 
 // =========================================================================
@@ -839,6 +912,22 @@ fn decode_rule_hidden_return_strategy() {
         .assign_address(&dt_int(8), &proto_empty(), -1, &PanicFactory, &mut status, &mut res, &model, &mgr)
         .unwrap();
     assert_eq!(r, AssignActionResponse::hiddenret_ptrparam);
+}
+
+#[test]
+fn dual_alignment_requires_shared_slots_and_is_explicitly_opted_in() {
+    let mgr = AddrSpaceManager::new();
+    let reg = reg_space_le();
+    for shared in [false, true] {
+        let mut model = ParamListStandard::new(ParamListKind::Standard);
+        model.push_entry(excl_entry_class(0, type_class::TYPECLASS_FLOAT, &reg, 0x10, 8, &[], &mgr));
+        model.push_entry(excl_entry(if shared { 0 } else { 1 }, &reg, 0x20, 8, model.get_entry(), &mgr));
+        model.finish_decode();
+        for align in [false, true] {
+            let xml = format!("<rule><datatype name=\"struct\"/><join_dual_class align=\"{align}\"/></rule>");
+            assert_eq!(decode_rule(&xml, &model, &mgr).is_ok(), !align || shared);
+        }
+    }
 }
 
 #[test]

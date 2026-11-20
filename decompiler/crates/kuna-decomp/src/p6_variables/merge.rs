@@ -283,6 +283,10 @@ pub trait MergeContext: HighContext {
     fn vn_has_no_descend(&self, vn: VarnodeId) -> bool;
     /// `vn->getSpace()->isBigEndian()`.
     fn vn_space_big_endian(&self, vn: VarnodeId) -> bool;
+    /// Whether a constant equals the ABI's logical padding at this byte offset.
+    fn vn_is_padding_piece(&self, _piece: VarnodeId, _whole: VarnodeId, _offset: int4) -> bool {
+        false
+    }
     /// `vn->getSpace()->getType() == IPTR_INTERNAL`.
     fn vn_space_internal(&self, vn: VarnodeId) -> bool;
     /// `vn->hasCover()`.
@@ -399,8 +403,6 @@ pub trait MergeContext: HighContext {
     /// `data.beginOpAlive()..endOpAlive()` — the alive-op list in C++ order.
     fn ops_alive(&self) -> Vec<OpId>;
 
-    /// (kuna) `option tiedphitrim`: [`crate::p6_variables::kuna_tiedphitrim`].
-    fn kuna_tied_phi_trim(&self) -> bool;
     /// (kuna) [`crate::kuna_stablenames::same_variable`].
     fn kuna_same_prior_variable(&self, _a: HighVariableId, _b: HighVariableId) -> Option<bool> {
         None
@@ -420,6 +422,8 @@ pub trait MergeContext: HighContext {
     fn global_copy_moves_write(&self, _global: HighVariableId, _value: HighVariableId) -> bool {
         false
     }
+    /// (kuna `persistcalls`) A merge copy is about to trim `op`'s input.
+    fn persist_trim(&mut self, _op: OpId) {}
     fn stack_copy_moves_write(&self, _storage: HighVariableId, _value: HighVariableId) -> bool {
         false
     }
@@ -1165,8 +1169,8 @@ pub struct Merge {
     copy_trims: Vec<OpId>,
     /// Roots of unmapped CONCAT trees (C++ `protoPartial`).
     proto_partial: Vec<OpId>,
-    /// (kuna) The outputs of the MULTIEQUALs `tiedphitrim` trimmed, with the
-    /// storage each was trimmed away from.
+    /// (kuna) The outputs of the MULTIEQUALs `kuna_tiedphitrim` trimmed, with
+    /// the storage each was trimmed away from.
     tied_phis: Vec<(VarnodeId, kuna_base::address::Address)>,
     /// (kuna decompile-all watchdog) Budget probes taken, and whether one saw
     /// the running drive's budget spent ([`Merge::budget`]).
@@ -1299,6 +1303,12 @@ impl Merge {
     /// The variables are sorted by earliest block, then each is matched against the
     /// stack of accepted variables; a match needs the speculative test to pass and
     /// no Cover intersection (else that particular pairing is skipped).
+    ///
+    /// A persistent, input or address-tied variable fails the speculative test
+    /// against every other, and merging never gives another variable those
+    /// properties, so it is neither matched nor stacked: upstream tests it
+    /// against the whole stack and every later variable against it, which is
+    /// quadratic in a group of thousands of same-typed globals.
     pub fn merge_linear(&mut self, ctx: &mut dyn MergeContext, highvec: &mut [HighVariableId]) -> KunaResult<()> {
         if highvec.len() <= 1 {
             return Ok(());
@@ -1313,6 +1323,9 @@ impl Merge {
         let mut highstack: Vec<HighVariableId> = Vec::new();
         let order: Vec<HighVariableId> = highvec.to_vec();
         for high in order {
+            if Self::never_speculative(ctx, high) {
+                continue;
+            }
             let mut merged_into = false;
             for &out in &highstack {
                 self.budget()?;
@@ -1329,6 +1342,12 @@ impl Merge {
             }
         }
         Ok(())
+    }
+
+    /// Does [`Self::merge_test_speculative`] refuse `high` whatever it is paired
+    /// with?
+    fn never_speculative(ctx: &mut dyn MergeContext, high: HighVariableId) -> bool {
+        ctx.high_is_persist(high) || ctx.high_is_input(high) || ctx.high_is_addr_tied(high)
     }
 
     /// Stable sort `highvec` by [`compare_high_by_block`] (the C++ `std::sort`).
@@ -1885,6 +1904,7 @@ impl Merge {
         addr: kuna_base::address::Address,
         trim_op: OpId,
     ) -> KunaResult<OpId> {
+        ctx.persist_trim(trim_op);
         let copy_op = ctx.copy_trim_op(in_vn, addr, trim_op)?;
         self.copy_trims.push(copy_op);
         Ok(copy_op)
@@ -2430,31 +2450,18 @@ impl Merge {
                     let p1 = ctx.vn_high(v1).and_then(|h| ctx.high_piece(h));
                     let p2 = ctx.vn_high(v2).and_then(|h| ctx.high_piece(h));
                     let p3 = ctx.vn_high(v3).and_then(|h| ctx.high_piece(h));
-                    let (p1, p2, p3) = match (p1, p2, p3) {
-                        (Some(a), Some(b), Some(c)) => (a, b, c),
-                        _ => continue,
-                    };
+                    let Some(p1) = p1 else { continue };
                     let (g1, o1) = (ctx.piece_group(p1), ctx.piece_offset(p1));
-                    let (g2, o2) = (ctx.piece_group(p2), ctx.piece_offset(p2));
-                    let (g3, o3) = (ctx.piece_group(p3), ctx.piece_offset(p3));
-                    if g1 != g2 || g1 != g3 {
-                        continue;
-                    }
-                    if ctx.vn_space_big_endian(v1) {
-                        if o2 != o1 {
-                            continue;
-                        }
-                        if o3 != o1 + ctx.vn_size(v2) {
-                            continue;
-                        }
+                    let (off2, off3) = if ctx.vn_space_big_endian(v1) {
+                        (0, ctx.vn_size(v2))
                     } else {
-                        if o3 != o1 {
-                            continue;
-                        }
-                        if o2 != o1 + ctx.vn_size(v3) {
-                            continue;
-                        }
-                    }
+                        (ctx.vn_size(v3), 0)
+                    };
+                    let matches = |vn, piece, offset| match piece {
+                        Some(p) => ctx.piece_group(p) == g1 && ctx.piece_offset(p) == o1 + offset,
+                        None => ctx.vn_is_padding_piece(vn, v1, offset),
+                    };
+                    if !matches(v2, p2, off2) || !matches(v3, p3, off3) { continue; }
                     ctx.op_mark_non_printing(op);
                     if ctx.vn_is_implied(v2) {
                         ctx.vn_clear_implied_set_explicit(v2);
@@ -2688,6 +2695,7 @@ mod tests {
         pieces: BTreeMap<u64, (HighVariableId, Vec<u64>)>,
         copy_shadow: bool,
         merged: Vec<(HighVariableId, HighVariableId, bool)>,
+        persist_reads: u64,
     }
 
     impl Mock {
@@ -2706,6 +2714,7 @@ mod tests {
                 pieces: BTreeMap::new(),
                 copy_shadow: false,
                 merged: Vec::new(),
+                persist_reads: 0,
             }
         }
         fn hs(&self, h: HighVariableId) -> &HighState {
@@ -2726,6 +2735,7 @@ mod tests {
                 size: 0,
                 type_: dt(1, type_metatype::TYPE_UNKNOWN),
                 type_lock: false,
+                site_locked: false,
                 merge_group: 0,
                 written: false,
                 def_time: 0,
@@ -2776,6 +2786,7 @@ mod tests {
             self.hs(h).input
         }
         fn high_is_persist(&mut self, h: HighVariableId) -> bool {
+            self.persist_reads += 1;
             self.hs(h).persist
         }
         fn high_is_extra_out(&mut self, h: HighVariableId) -> bool {
@@ -3075,9 +3086,6 @@ mod tests {
         }
         fn ops_alive(&self) -> Vec<OpId> {
             Vec::new()
-        }
-        fn kuna_tied_phi_trim(&self) -> bool {
-            false
         }
         fn single_read_cover(&self, _vn: VarnodeId, _op: OpId) -> Cover {
             Cover::new()
@@ -3591,6 +3599,34 @@ mod tests {
         for (_, _, spec) in &m.merged {
             assert!(*spec, "mergeLinear merges must be speculative");
         }
+    }
+
+    /// Globals of one type never merge speculatively, so a group of thousands
+    /// of them must not be tested pair by pair: the two locals among them merge
+    /// exactly as they would alone, and each global is read once.
+    #[test]
+    fn merge_linear_does_not_pair_up_globals() {
+        let mut m = Mock::new();
+        let shared = dt(8, type_metatype::TYPE_UNKNOWN);
+        let globals = 300u32;
+        for n in 1..=globals + 2 {
+            let mut s = HighState::default();
+            s.has_cover = true;
+            s.type_ = Some(shared.clone());
+            s.cover = cover_block(n as int4 - 1, 0, 5);
+            s.instances = vec![vid(n as u64)];
+            s.persist = n != 7 && n != 200;
+            add_high(&mut m, n, s);
+            m.vn_addr.insert(vkey(vid(n as u64)), Address::new_invalid());
+        }
+        let mut merge = Merge::new(HighIntersectTest::new(PcodeOpSet::new(
+            Box::new(Vec::new),
+            Box::new(|_, _| true),
+        )));
+        let mut highvec: Vec<HighVariableId> = (1..=globals + 2).map(hid).collect();
+        merge.merge_linear(&mut m, &mut highvec).unwrap();
+        assert_eq!(m.merged, vec![(hid(7), hid(200), true)]);
+        assert!(m.persist_reads <= 2 * u64::from(globals + 2) + 4, "{} reads", m.persist_reads);
     }
 
     // --- Merge::clear resets the cache + trim/partial lists ----------------

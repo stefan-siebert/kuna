@@ -183,45 +183,6 @@ fn stripped_go_functions_recovered_from_pclntab() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// The gating proof: with `--option gopclntab off` the recovery is suppressed, so
-/// the same stripped binary's `main.compute` is NOT named (it falls back to
-/// `sub_<addr>`). This pins that the names came from the pass, not some other
-/// seam, and that the flag actually gates it.
-#[test]
-fn gopclntab_off_suppresses_recovery() {
-    if !go_available() {
-        eprintln!("verify_go_pclntab: skipping (`go` not on PATH)");
-        return;
-    }
-    let dir = std::env::temp_dir().join(format!("kuna_go_pclntab_off_{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let out_bin = dir.join("go_stripped");
-    if !build_go(&dir, &out_bin, "linux", "amd64", /* strip */ true) {
-        let _ = std::fs::remove_dir_all(&dir);
-        panic!("installed Go compiler failed to build the fixture");
-    }
-    let bin = out_bin.to_str().expect("utf8 path").to_string();
-
-    let specs = repo_root().join("specs");
-    let spec_roots = vec![specs.to_str().unwrap().to_string()];
-    let mut prog = bootstrap_from_object(&bin, "", &spec_roots)
-        .expect("bootstrap fixture with built processor specs");
-    // Turn the pass OFF before the deferred commit consults the flag.
-    prog.arch_mut()
-        .set_kuna_option("gopclntab", "off")
-        .expect("gopclntab off applies");
-    prog.commit_pending_analysis().expect("analysis commit succeeds");
-
-    // With the pass gated off, the pclntab names are NOT installed on this stripped
-    // binary — `main.compute` has no symbol.
-    assert!(
-        prog.lookup_symbol("main.compute").is_none(),
-        "gopclntab off must suppress pclntab name recovery (main.compute should be absent)"
-    );
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// An internally linked ELF PIE. go1.25 and older put its table in
 /// `.data.rel.ro.gopclntab` (the relro spelling of `.gopclntab`, go1.26+ moved it
 /// back), so on those toolchains the names come only from that section.
@@ -319,15 +280,12 @@ fn stripped_go_pe_functions_recovered_from_pclntab() {
     }
 }
 
-/// `gowalkprune`: the fast inventory walk leaves the functions the pclntab names
-/// to the table. On a stripped Go ELF the walk roots are pclntab functions found
-/// by the entry oracles; on a Go PE every pclntab function with a `.pdata` record
-/// is one. With the option off the walk follows calls through the Go runtime,
-/// and a function it reaches only that way gains a `sub_<addr>` alias beside its
-/// pclntab name; on, those are not walked, and only the roots keep the alias
-/// their entry source gave them. The inventory (addresses, names, sizes) is the
-/// same either way. With `gopclntab` off nothing commits the table's functions,
-/// so the walk keeps every root.
+/// The fast inventory walk leaves the functions the pclntab names to the
+/// table. On a stripped Go ELF the walk roots are pclntab functions found by
+/// the entry oracles; on a Go PE every pclntab function with a `.pdata` record
+/// is one. A function the walk would reach only through a call carries no
+/// `sub_<addr>` alias beside its pclntab name; only the roots keep the alias
+/// their entry source gave them.
 #[test]
 fn fast_inventory_walk_leaves_pclntab_functions_to_the_table() {
     if !go_available() {
@@ -354,31 +312,87 @@ fn fast_inventory_walk_leaves_pclntab_functions_to_the_table() {
             prog.commit_pending_analysis().expect("analysis commit succeeds");
             prog.function_entries_canonical()
         };
-        let walked = inventory(&[("gowalkprune", "off")]);
-        let pruned = inventory(&[("gowalkprune", "on")]);
-
-        let shape = |entries: &[kuna_console::engine::FunctionEntry]| {
-            entries.iter().map(|e| (e.addr.get_offset(), e.name.clone(), e.size)).collect::<Vec<_>>()
-        };
-        assert_eq!(shape(&walked), shape(&pruned), "{goos}: the inventory must not change");
-        assert!(walked.iter().any(|e| e.name == "main.compute"), "{goos}: pclntab names recovered");
-        let generated_aliases = |entries: &[kuna_console::engine::FunctionEntry]| {
-            entries
-                .iter()
-                .filter(|e| !e.name.starts_with("sub_") && e.aliases.iter().any(|a| a.starts_with("sub_")))
-                .map(|e| e.addr.get_offset())
-                .collect::<std::collections::BTreeSet<u64>>()
-        };
-        let (walked_aliases, pruned_aliases) = (generated_aliases(&walked), generated_aliases(&pruned));
+        let pruned = inventory(&[]);
+        assert!(pruned.iter().any(|e| e.name == "main.compute"), "{goos}: pclntab names recovered");
+        if goos == "windows" {
+            // Every pclntab function with a `.pdata` record is a root, so nearly all
+            // keep the alias their entry source gave them; the count says nothing here.
+            let _ = std::fs::remove_dir_all(&dir);
+            continue;
+        }
+        let aliased = pruned
+            .iter()
+            .filter(|e| !e.name.starts_with("sub_") && e.aliases.iter().any(|a| a.starts_with("sub_")))
+            .count();
         assert!(
-            pruned_aliases.is_subset(&walked_aliases) && pruned_aliases.len() < walked_aliases.len(),
-            "{goos}: gowalkprune on must not walk the pclntab functions the roots call \
-             ({} aliased pruned, {} walked)",
-            pruned_aliases.len(),
-            walked_aliases.len()
+            aliased < pruned.len() / 2,
+            "{goos}: the pclntab functions the roots call must not be walked ({aliased} of {} aliased)",
+            pruned.len()
         );
-        let tableless = |prune| shape(&inventory(&[("gopclntab", "off"), ("gowalkprune", prune)]));
-        assert_eq!(tableless("on"), tableless("off"), "{goos}: without gopclntab every root is walked");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Zero the 4-byte magic of every `pcHeader` in the file at `bin` (a magic
+/// followed by two zero pad bytes, a quantum of 1, 2 or 4 and a pointer size of
+/// 4 or 8), writing the result to `out`. Returns how many were wiped.
+fn wipe_pclntab_magic(bin: &std::path::Path, out: &std::path::Path) -> usize {
+    let mut bytes = std::fs::read(bin).expect("read fixture");
+    let hits: Vec<usize> = bytes
+        .windows(8)
+        .enumerate()
+        .step_by(4)
+        .filter(|(_, w)| {
+            let magic = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            matches!(magic, 0xffff_fffa | 0xffff_fffb | 0xffff_fff0 | 0xffff_fff1)
+                && w[4..6] == [0, 0]
+                && matches!(w[6], 1 | 2 | 4)
+                && matches!(w[7], 4 | 8)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    for &i in &hits {
+        bytes[i..i + 4].fill(0);
+    }
+    std::fs::write(out, bytes).expect("write wiped fixture");
+    hits.len()
+}
+
+/// A packer that overwrites the `pcHeader` magic leaves the table and
+/// `runtime.firstmoduledata` intact. The inventory of the wiped image must be
+/// the unmodified image's, name for name and extent for extent, on each
+/// container format, and `main.main` must still call `main.compute` by name.
+#[test]
+fn wiped_pclntab_magic_recovers_the_same_functions() {
+    if !go_available() {
+        eprintln!("verify_go_pclntab: skipping (`go` not on PATH)");
+        return;
+    }
+    for (goos, goarch) in [("linux", "amd64"), ("windows", "amd64"), ("darwin", "arm64"), ("linux", "386")] {
+        let dir = std::env::temp_dir().join(format!("kuna_go_wiped_{goos}_{goarch}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (intact, wiped) = (dir.join("go_stripped"), dir.join("go_wiped"));
+        if !build_go(&dir, &intact, goos, goarch, /* strip */ true) {
+            let _ = std::fs::remove_dir_all(&dir);
+            panic!("installed Go compiler failed to build the {goos}/{goarch} fixture");
+        }
+        assert_eq!(wipe_pclntab_magic(&intact, &wiped), 1, "{goos}/{goarch}: one pcHeader to wipe");
+        let inventory = |bin: &std::path::Path| {
+            let prog = bootstrap(bin.to_str().expect("utf8 path"));
+            let entries: Vec<(u64, String, u64)> = prog
+                .function_entries_canonical()
+                .into_iter()
+                .map(|e| (e.addr.get_offset(), e.name, e.size))
+                .collect();
+            (prog, entries)
+        };
+        let (_, want) = inventory(&intact);
+        let (prog, got) = inventory(&wiped);
+        assert!(want.iter().any(|e| e.1 == "main.compute"), "{goos}/{goarch}: intact names recovered");
+        assert_eq!(got.len(), want.len(), "{goos}/{goarch}: function count");
+        assert!(got == want, "{goos}/{goarch}: the wiped image's inventory differs from the intact one");
+        let c = decompile(prog, "main.main");
+        assert!(c.contains("main.compute("), "{goos}/{goarch} wiped main.main must call main.compute by name:\n{c}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

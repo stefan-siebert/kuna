@@ -10,7 +10,7 @@
 //! protocols, ivars, properties) are skipped by offset, faithful to the minimal
 //! `ObjcTypeMetadataAnalyzer` walk (§3.2 of the design).
 
-use super::sections::MachoImage;
+use super::sections::{MachoImage, RECORD_WORK};
 
 /// The 64-bit `class_t.data` low-bit mask Ghidra/`objc4` calls `FAST_DATA_MASK`:
 /// the `data` word packs `RW`/realized flags in the low 3 bits, so `data & ~0x7`
@@ -23,6 +23,9 @@ mod class_t {
     /// `isa` — points at the metaclass `class_t` (its `baseMethods` are the `+`
     /// class methods).
     pub const ISA: u64 = 0x00;
+    /// `superclass` — the superclass `class_t` (a bind slot for one defined in
+    /// another image).
+    pub const SUPERCLASS: u64 = 0x08;
     /// `data` — `class_ro_t*` once `FAST_DATA_MASK` is applied.
     pub const DATA: u64 = 0x20;
 }
@@ -31,6 +34,10 @@ mod class_t {
 /// `reserved` are four `u32`s, then pointer-sized `ivarLayout`, `name`,
 /// `baseMethodList`, ….
 mod class_ro_t {
+    /// `instanceStart` (`u32`) — the offset of this class's first own ivar.
+    pub const INSTANCE_START: u64 = 0x04;
+    /// `instanceSize` (`u32`) — the instance size including the superclasses.
+    pub const INSTANCE_SIZE: u64 = 0x08;
     /// `name` — the NUL-terminated class name (`Greeter`).
     pub const NAME: u64 = 0x18;
     /// `baseMethodList` — the instance `method_list_t*` (NULL when the class
@@ -40,6 +47,8 @@ mod class_ro_t {
     /// variables). After `name`(0x18), `baseMethodList`(0x20), `baseProtocols`
     /// (0x28) comes `ivars`(0x30).
     pub const IVARS: u64 = 0x30;
+    /// `baseProperties` — the `property_list_t*`, after `weakIvarLayout`(0x38).
+    pub const BASE_PROPERTIES: u64 = 0x40;
 }
 
 /// `ivar_list_t` header offsets (the same `entsizeAndFlags`/`count` shape as
@@ -64,6 +73,8 @@ mod ivar_t {
     pub const NAME: u64 = 0x08;
     /// `type` — the NUL-terminated ObjC type encoding of the ivar's element.
     pub const TYPE: u64 = 0x10;
+    /// `size` (`u32`) — the ivar's byte size.
+    pub const SIZE: u64 = 0x1c;
 }
 
 /// A resolved `class_t`: the addresses the method walk needs.
@@ -89,6 +100,25 @@ pub fn read_class_t(img: &MachoImage, addr: u64) -> Option<ClassT> {
     Some(ClassT { addr, isa, ro })
 }
 
+/// The superclass name of the `class_t` at `addr`: read off the superclass
+/// `class_t` when the slot is a rebase, or off the import name
+/// (`_OBJC_CLASS_$_NSObject`) when it is a bind. `None` for a root class.
+pub fn superclass_name(img: &MachoImage, addr: u64) -> Option<String> {
+    let slot = addr.wrapping_add(class_t::SUPERCLASS);
+    match img.rebase_ptr(slot) {
+        Some(sup) => class_name(img, read_class_t(img, sup)?.ro),
+        None => img.bind_name(slot).and_then(|n| n.strip_prefix("_OBJC_CLASS_$_")).map(str::to_string),
+    }
+}
+
+/// `(instanceStart, instanceSize)` of the `class_ro_t` at `ro`.
+pub fn instance_extent(img: &MachoImage, ro: u64) -> Option<(u32, u32)> {
+    Some((
+        img.read_u32(ro.wrapping_add(class_ro_t::INSTANCE_START))?,
+        img.read_u32(ro.wrapping_add(class_ro_t::INSTANCE_SIZE))?,
+    ))
+}
+
 /// The class name at `class_ro_t.name`, NUL-terminated ASCII (`Greeter`). `None`
 /// when the `name` pointer / string is unreadable or non-ASCII.
 pub fn class_name(img: &MachoImage, ro: u64) -> Option<String> {
@@ -103,11 +133,45 @@ pub fn class_name(img: &MachoImage, ro: u64) -> Option<String> {
 /// `Some(0)` when the class defines no methods.
 pub fn base_methods(img: &MachoImage, ro: u64) -> Option<u64> {
     let p = img.read_ptr(ro.wrapping_add(class_ro_t::BASE_METHODS))?;
-    if p == 0 {
+    if p == 0 || p & 1 != 0 {
         None
     } else {
         Some(p)
     }
+}
+
+/// Every `method_list_t` of `class_ro_t.baseMethods`: the one list it points
+/// at, or — with its low bit set, a dyld shared cache's preattached categories
+/// — the lists a `relative_list_list_t` names: `u32 entsizeAndFlags, u32 count`
+/// then `count` eight-byte entries whose `>> 16` is the list's offset from
+/// the entry itself (the low 16 bits are the image index).
+pub fn method_lists(img: &MachoImage, ro: u64) -> Vec<u64> {
+    let Some(p) = img.read_ptr(ro.wrapping_add(class_ro_t::BASE_METHODS)) else { return Vec::new() };
+    if p == 0 {
+        return Vec::new();
+    }
+    if p & 1 == 0 {
+        return vec![p];
+    }
+    let header = p & !1;
+    let (Some(ent), Some(count)) = (img.read_u32(header), img.read_u32(header.wrapping_add(4))) else {
+        return Vec::new();
+    };
+    if ent & 0xffff != 8 {
+        return Vec::new();
+    }
+    (0..count.min(1024) as u64)
+        .filter_map(|i| {
+            let at = header.wrapping_add(8).wrapping_add(i * 8);
+            let entry = img.read_ptr(at)? as i64;
+            Some(at.wrapping_add((entry >> 16) as u64))
+        })
+        .collect()
+}
+
+/// The `baseProperties` (`property_list_t*`) at `class_ro_t.baseProperties`.
+pub fn base_properties(img: &MachoImage, ro: u64) -> Option<u64> {
+    img.read_ptr(ro.wrapping_add(class_ro_t::BASE_PROPERTIES)).filter(|&p| p != 0)
 }
 
 /// The metaclass `class_ro_t` reached through `class_t.isa.data`: its
@@ -142,6 +206,10 @@ pub struct Ivar {
     pub name: String,
     /// The ivar's ObjC type encoding (`q`, `@`, …), or `None` when unreadable.
     pub types: Option<String>,
+    /// The instance offset the offset variable holds (its compile-time value).
+    pub offset: u32,
+    /// The ivar's byte size.
+    pub size: u32,
 }
 
 /// Walk an `ivar_list_t` at `list_va`, returning each resolved [`Ivar`]. The
@@ -159,6 +227,9 @@ pub fn walk_ivar_list(img: &MachoImage, list_va: u64) -> Vec<Ivar> {
     }
     let count = count.min(4096);
     for i in 0..count as u64 {
+        if !img.charge(RECORD_WORK) {
+            break;
+        }
         let rec = list_va
             .wrapping_add(ivar_list_t::FIRST)
             .wrapping_add(i.wrapping_mul(entsize));
@@ -175,7 +246,9 @@ pub fn walk_ivar_list(img: &MachoImage, list_va: u64) -> Vec<Ivar> {
         if offset_va == 0 || name.is_empty() {
             continue;
         }
-        out.push(Ivar { offset_va, name, types });
+        let Some(offset) = img.read_u32(offset_va) else { continue };
+        let size = img.read_u32(rec.wrapping_add(ivar_t::SIZE)).unwrap_or(0);
+        out.push(Ivar { offset_va, name, types, offset, size });
     }
     out
 }

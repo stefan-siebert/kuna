@@ -31,6 +31,13 @@
 //! defined-function reader lifted out of [`crate::loadimage_object`].
 
 pub mod arm_markers;
+pub(crate) mod kuna_ppcaputarget;
+pub(crate) mod kuna_ppc64elfv2target;
+#[cfg(test)]
+mod powerpc_apu_tests;
+pub(crate) mod kuna_mipstarget;
+#[cfg(test)]
+mod mips_target_tests;
 // (kuna) ELF import markup read out of `PT_DYNAMIC`, for an image whose section
 // table is missing or unusable and whose `.dynsym`/`.rela.*`/`.plt*` are
 // therefore invisible.
@@ -40,7 +47,10 @@ pub mod elf_plt;
 pub mod kuna_globalref;
 pub mod elfv1;
 mod elfv1_imports;
-mod kuna_ppc32_imports;
+pub mod kuna_ppc32_imports;
+pub mod kuna_ppc64r12;
+mod kuna_ppc32picimports;
+pub use kuna_ppc32picimports::{ImportProofMemo, ImportProofScope};
 // (kuna) ELF section-table tolerance: an image whose section headers are
 // unreadable still has program headers describing every loadable byte.
 pub mod elf_shdr;
@@ -58,6 +68,8 @@ pub mod reloc_object;
 // Architecture-aware ELF instruction/data relocation encoders used by the
 // relocatable-object layout. Kept separate so bitfield rules are unit-testable.
 mod reloc_apply;
+// (kuna) MIPS relocations, `$gp` and GOT for a relocatable object.
+mod kuna_mipsreloc;
 mod kuna_commonalloc;
 mod kuna_sparc_relcode;
 // (kuna) `relocrebase`: rebase the load-time analysis facts of a relocatable
@@ -68,12 +80,16 @@ pub(crate) mod le;
 // .rel.dyn / .rela.plt) so a GOT slot holds the value the run-time loader
 // would write, and report the PT_GNU_RELRO-frozen slots as constant.
 pub mod kuna_dynrelocs;
+// (kuna `dynrelocs`) The MIPS primary-GOT slots the dynamic linker fills with an
+// address the image defines, reported constant.
+pub mod kuna_mipsgot;
 // (kuna) The pointers an image stores in its data, as its rebase / relocation
 // metadata lists them (the data half of `kuna xrefs`).
 pub mod kuna_dataptrs;
 // (kuna) `pltlocal`: the PLT stubs the image's own relocations bind to a
 // function it defines.
 pub(crate) mod kuna_pltlocal;
+pub mod kuna_elfgotimports;
 // (kuna) `msvcfpconst`: recover an MSVC `__real@` floating-point constant COMDAT
 // from its mangled symbol name -- materialise the undefined half's bytes at its
 // synthetic extern slot, and mark both halves foldable.
@@ -82,14 +98,28 @@ pub mod format;
 // (kuna) PE/Mach-O import-slot call binding (`peimportcall`): `externref` over
 // typed import-pointer slots + upstream's strictly PE-only no-return API names.
 pub mod kuna_peimportcall;
+pub mod kuna_authptrcall;
 // (kuna) `rexthunk`: an x86-64 `REX FF 25` tail jump is not an import thunk.
 pub(crate) mod kuna_rexthunk;
 // (kuna) `peordinal`: name a PE import-by-ordinal from a built-in export table.
 pub(crate) mod kuna_peordinal;
+// (kuna #1288) the PC memory a DOS program shares with the machine, volatile.
+pub mod kuna_pcmemory;
+// (kuna `kernelcache`) IMG4/IM4P/LZFSE/complzss unwrapping and MH_FILESET entry
+// selection for Apple kernelcaches.
+pub mod kuna_kernelcache;
 pub mod macho_fat;
+// (kuna) The dyld shared cache: one image rebuilt as a thin Mach-O, its
+// references into other images named (`dyldimage`, `dyldcrossrefs`).
+pub mod kuna_dyldcache;
 pub mod macho_stubs;
 pub(crate) mod macho_trie;
 pub mod mips_markers;
+pub mod kuna_mipsentry;
+pub(crate) mod kuna_mipsabi;
+pub mod kuna_mipsocteon;
+// (kuna) RISC-V Zcmp/Zcmt language selection from `Tag_RISCV_arch`.
+pub mod kuna_riscvzc;
 // (kuna) Go toolchain version off the build-info blob (goreg shell layouts).
 pub mod gobuildinfo;
 pub mod noreturn;
@@ -104,3 +134,9 @@ pub mod kuna_floatabi;
 pub mod kuna_returnext;
 // (kuna #1288) the x86 real-mode code segment a loader paints into the decode context.
 pub mod kuna_realmodecs;
+// (kuna `mzdgroup`) the data segment an MS-DOS program's startup code loads into DS.
+pub mod kuna_mzdgroup;
+
+pub mod kuna_mipsstubs;
+
+mod kuna_nullable_reloc;

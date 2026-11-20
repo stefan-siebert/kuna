@@ -14,9 +14,9 @@ use kuna_num::opcodes::OpCode;
 const MAX_BYTES: usize = 4096;
 const MAX_ARGS: usize = 16;
 
-pub struct Argument {
-    pub pointer: VarnodeId,
-    pub primitive: &'static str,
+pub enum Argument {
+    Primitive { pointer: VarnodeId, primitive: &'static str },
+    String { data: VarnodeId, length: VarnodeId, pointer_bridge: bool },
 }
 
 pub struct Plan {
@@ -25,10 +25,17 @@ pub struct Plan {
     pub arguments: Vec<Argument>,
 }
 
+pub(crate) enum Writer {
+    String { value: VarnodeId, pointer_bridge: bool },
+    Io(super::kuna_rustfmtio::Writer),
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum MacroKind {
     Print(bool),
     Format,
+    Panic,
+    Write,
 }
 
 /// Full demangled identities, before display-name normalization. Conflicting
@@ -45,7 +52,7 @@ pub fn formatter_symbols(
 }
 
 pub(crate) fn recover(fd: &Funcdata, arch: &Architecture, id: OpId) -> Option<Plan> {
-    if !arch.rust_fmt_args
+    if !arch.rust_fmt.recovers()
         || arch.source_lang() != crate::kuna_sourcelang::SourceLang::Rust
         || !matches!(arch.rustc_stable_version, Some((1, 93, 0 | 1)))
     {
@@ -67,16 +74,32 @@ pub(crate) fn recover_at(
     array_slot: i32,
     kind: MacroKind,
 ) -> Option<Plan> {
-    if !arch.rust_fmt_args
+    if fd.obank().get(id)?.get_out().is_some() {
+        return None;
+    }
+    recover_inputs_at(fd, arch, id, template_slot, array_slot, kind)
+}
+
+/// Decode formatting inputs after the consumer validates its result ABI.
+pub(crate) fn recover_inputs_at(
+    fd: &Funcdata,
+    arch: &Architecture,
+    id: OpId,
+    template_slot: i32,
+    array_slot: i32,
+    kind: MacroKind,
+) -> Option<Plan> {
+    if !arch.rust_fmt.recovers()
         || arch.source_lang() != crate::kuna_sourcelang::SourceLang::Rust
         || !matches!(arch.rustc_stable_version, Some((1, 93, 0 | 1)))
         || (arch.rust_display_formatters.is_empty()
-            && (!arch.rust_fmt_flags || arch.rust_integer_formatters.is_empty()))
+            && arch.rust_integer_formatters.is_empty()
+            && arch.rust_str_display_formatters.is_empty())
     {
         return None;
     }
     let call = fd.obank().get(id)?;
-    if call.code() != OpCode::CPUI_CALL || call.get_out().is_some() {
+    if call.code() != OpCode::CPUI_CALL {
         return None;
     }
     let space = fd.get_arch().manage().get_default_data_space()?;
@@ -92,7 +115,7 @@ pub(crate) fn recover_at(
         return None;
     }
     let mut position = 0usize;
-    let decoded = decode_template(arch.rust_fmt_flags, |size| {
+    let decoded = decode_template(true, |size| {
         let end = position.checked_add(size)?;
         if end > MAX_BYTES {
             return None;
@@ -113,19 +136,35 @@ pub(crate) fn recover_at(
         position = end;
         Some(bytes)
     })?;
-    let cells = argument_cells(fd, id, array, decoded.count)?;
-    let mut arguments = Vec::with_capacity(decoded.count);
-    let mut formatters = Vec::with_capacity(decoded.count);
-    for index in 0..decoded.count {
+    let (arguments, formatters) = primitive_arguments(fd, arch, id, array, decoded.count)?;
+    let (name, literal) = decoded.render(kind, &formatters)?;
+    Some(Plan {
+        name,
+        literal,
+        arguments,
+    })
+}
+
+pub(crate) fn primitive_arguments(
+    fd: &Funcdata,
+    arch: &Architecture,
+    id: OpId,
+    array: i64,
+    count: usize,
+) -> Option<(Vec<Argument>, Vec<Formatter>)> {
+    if count > MAX_ARGS || array % 8 != 0 {
+        return None;
+    }
+    let cells = stack_cells(fd, id, array, count * 2)?;
+    let mut arguments = Vec::with_capacity(count);
+    let mut formatters = Vec::with_capacity(count);
+    for index in 0..count {
         let pointer = cells[index * 2];
         let address = constant_word(fd, cells[index * 2 + 1])?;
-        let formatter = if arch.rust_fmt_flags {
-            *arch.rust_integer_formatters.get(&address)?
-        } else {
-            Formatter {
-                primitive: *arch.rust_display_formatters.get(&address)?,
-                kind: Trait::Display,
-            }
+        let Some(formatter) = arch.rust_integer_formatters.get(&address).copied() else {
+            arguments.push(super::kuna_rustfmtstr::recover(fd, arch, id, address, pointer)?);
+            formatters.push(Formatter { primitive: "&str", kind: Trait::Display });
+            continue;
         };
         let primitive = formatter.primitive;
         let offset = stack_offset(fd, pointer)?;
@@ -139,21 +178,21 @@ pub(crate) fn recover_at(
         if offset % size != 0 {
             return None;
         }
-        arguments.push(Argument { pointer, primitive });
+        arguments.push(Argument::Primitive { pointer, primitive });
         formatters.push(formatter);
     }
-    let (name, literal) = decoded.render(kind, &formatters)?;
-    Some(Plan {
-        name,
-        literal,
-        arguments,
-    })
+    Some((arguments, formatters))
 }
 
-fn argument_cells(fd: &Funcdata, call: OpId, base: i64, count: usize) -> Option<Vec<VarnodeId>> {
+pub(crate) fn stack_cells(
+    fd: &Funcdata,
+    call: OpId,
+    base: i64,
+    words: usize,
+) -> Option<Vec<VarnodeId>> {
     let stack = fd.get_arch().manage().get_stack_space()?;
-    let mut cells = vec![None; count * 2];
-    let end = base.checked_add((count * 16) as i64)?;
+    let mut cells = vec![None; words];
+    let end = base.checked_add((words * 8) as i64)?;
     for id in fd.obank().iter_alive() {
         let op = fd.obank().get(id)?;
         if op.code() != OpCode::CPUI_INDIRECT || op.is_indirect_creation() {
@@ -185,7 +224,7 @@ fn argument_cells(fd: &Funcdata, call: OpId, base: i64, count: usize) -> Option<
     cells.into_iter().collect()
 }
 
-fn constant_word(fd: &Funcdata, mut id: VarnodeId) -> Option<u64> {
+pub(crate) fn constant_word(fd: &Funcdata, mut id: VarnodeId) -> Option<u64> {
     for _ in 0..8 {
         let value = fd.vbank().get(id)?;
         if value.get_size() != 8 {
@@ -210,7 +249,7 @@ fn constant_word(fd: &Funcdata, mut id: VarnodeId) -> Option<u64> {
     None
 }
 
-fn stack_offset(fd: &Funcdata, mut id: VarnodeId) -> Option<i64> {
+pub(crate) fn stack_offset(fd: &Funcdata, mut id: VarnodeId) -> Option<i64> {
     let base = fd
         .get_arch()
         .manage()
@@ -250,6 +289,36 @@ fn stack_offset(fd: &Funcdata, mut id: VarnodeId) -> Option<i64> {
         }
     }
     None
+}
+
+pub(crate) fn render_pieces(
+    literals: Vec<String>,
+    arguments: Vec<Argument>,
+    formatters: Vec<Formatter>,
+    stderr: bool,
+) -> Option<Plan> {
+    let count = arguments.len();
+    if formatters.len() != count || !(count..=count + 1).contains(&literals.len()) {
+        return None;
+    }
+    let mut pieces = Vec::new();
+    for (index, text) in literals.into_iter().enumerate() {
+        pieces.push(Piece::Literal(text));
+        if index < count {
+            pieces.push(Piece::Argument(index, Options::default()));
+        }
+    }
+    let decoded = Template {
+        pieces,
+        count,
+        indexed: false,
+    };
+    let (name, literal) = decoded.render(MacroKind::Print(stderr), &formatters)?;
+    Some(Plan {
+        name,
+        literal,
+        arguments,
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -332,7 +401,7 @@ impl Template {
     ) -> Option<(&'static str, String)> {
         let newline = match self.pieces.last_mut() {
             Some(Piece::Literal(text))
-                if matches!(kind, MacroKind::Print(_)) && text.ends_with('\n') =>
+                if matches!(kind, MacroKind::Print(_) | MacroKind::Write) && text.ends_with('\n') =>
             {
                 text.pop();
                 true
@@ -345,6 +414,9 @@ impl Template {
             (MacroKind::Print(true), false) => "eprint!",
             (MacroKind::Print(true), true) => "eprintln!",
             (MacroKind::Format, _) => "format!",
+            (MacroKind::Panic, _) => "panic!",
+            (MacroKind::Write, false) => "write!",
+            (MacroKind::Write, true) => "writeln!",
         };
         let mut literal = String::from("\"");
         for piece in self.pieces {

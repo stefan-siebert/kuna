@@ -379,8 +379,10 @@ fn listing_for(args: &DisArgs, prog: &ConsoleProgram, region: Region) -> Result<
             if cut_short_by_image(&region, args.count, rows.len(), end) {
                 notes.push(image_bound_note(prog, &region));
             }
+            notes.extend(flow_end_note(prog, &region));
             if args.json {
-                format!("{}\n", dumps_indent2(&result_json(args, &region, &rows, truncated, &notes)))
+                let doc_notes = crate::funcdecl::json_notes(prog, &notes);
+                format!("{}\n", dumps_indent2(&result_json(args, &region, &rows, truncated, &doc_notes)))
             } else {
                 render_text(&region, &rows, truncated)
             }
@@ -402,7 +404,8 @@ fn listing_for(args: &DisArgs, prog: &ConsoleProgram, region: Region) -> Result<
             let provenance = provenance::of(view, slice, &repairs, prog, region.start, end);
             notes.extend(provenance.notes());
             if args.json {
-                let doc = data_result_json(args, &region, &rows, truncated, &notes, &fixups, &provenance);
+                let doc_notes = crate::funcdecl::json_notes(prog, &notes);
+                let doc = data_result_json(args, &region, &rows, truncated, &doc_notes, &fixups, &provenance);
                 format!("{}\n", dumps_indent2(&doc))
             } else {
                 render_data_text(&region, &rows, truncated)
@@ -733,6 +736,30 @@ fn image_bound_note(prog: &ConsoleProgram, region: &Region) -> String {
     )
 }
 
+/// (kuna #1288) Say that the function's flow, not the next entry, ended a
+/// listing whose length came from the extent, and name the range that lists
+/// the bytes it left out (`ConsoleProgram::extent_cut_by_flow`). A listing
+/// from inside a function names the function.
+fn flow_end_note(prog: &ConsoleProgram, region: &Region) -> Option<String> {
+    if !region.derived {
+        return None;
+    }
+    let (extent, clip) = prog.extent_cut_by_flow(region.start)?;
+    if extent == 0 || region.end != Some(region.start.saturating_add(extent)) {
+        return None;
+    }
+    let (end, stop) = (region.start + extent, region.start + clip);
+    let subject = match prog.entries_containing(&[region.start]).pop().flatten() {
+        Some(owner) => format!("0x{:x} is in {}, which", region.start, owner.name),
+        None => region.name.clone().unwrap_or_else(|| format!("0x{:x}", region.start)),
+    };
+    Some(format!(
+        "{subject} ends at 0x{end:x}, after the last instruction its flow reaches; its flow reaches \
+         none of the {} bytes from there to 0x{stop:x} (the range 0x{end:x}-0x{stop:x} lists them)",
+        clip - extent
+    ))
+}
+
 /// Split an explicit `start-end` / `start..end` range operand.
 ///
 /// Both halves must read as addresses, and a single `-` additionally needs a
@@ -903,7 +930,7 @@ fn render_text(region: &Region, rows: &[Row], truncated: bool) -> String {
         }
     );
     for r in rows {
-        let line = format!("{:<14}{:<22}{}", format!("0x{:x}", r.addr), r.hex(), r.text());
+        let line = format!("{:<13} {:<22}{}", format!("0x{:x}", r.addr), r.hex(), r.text());
         let _ = writeln!(out, "{}", line.trim_end());
     }
     out
@@ -1237,12 +1264,16 @@ fn usage() {
          The data view lists the load image's bytes. Each load-time fixup slot they\n\
          overlap is in fixups:[{{address,size,kind,symbol,target,file_bytes,image_bytes,\n\
          returned}}]: returned is `file`, `applied` (the loader's value) or `placeholder`\n\
-         (a bind's zero), and fixups_coverage names the metadata it came from.\n\
-         provenance:[{{start,end,size,source,file_offset,segment}}] cuts the span where\n\
-         its bytes' source changes: `file`, `zero-fill` (memory the segment declares\n\
-         past its file content), `repaired` (a header field kuna rewrote so the\n\
-         image parses) or `unknown`; segment carries the segment's name,\n\
-         extent, file extent and declared permissions (`r-x`, `---`)."
+         (a bind's zero), and fixups_coverage names the metadata it came from, or is\n\
+         `partial` (with fixups_reason) when some of that metadata could not be read.\n\
+         provenance:[{{start,end,size,source,file_offset,segment,overlaps}}] cuts the\n\
+         span where its bytes' source changes: `file`, `zero-fill` (memory the segment\n\
+         declares past its file content), `repaired` (a header field kuna rewrote so\n\
+         the image parses) or `unknown`; segment carries the segment's table index,\n\
+         name, extent, file extent and declared permissions (`r-x`, `---`). Where\n\
+         segments overlap, kuna reads the lowest-starting one (the first listed among\n\
+         equal starts; zero fill gives way to the next segment's bytes), and overlaps\n\
+         lists every other segment declaring the range, with its file offset."
     );
 }
 

@@ -301,11 +301,11 @@ fn unhandled_machine_is_inert() {
 /// alone included, with what the loader stores where the image says it.
 #[test]
 fn fixup_sites_list_every_slot_with_its_kind() {
-    use crate::loader::kuna_dataptrs::Coverage;
+    use crate::loader::kuna_dataptrs::{Coverage, Source};
     let bytes = image64(62, 8, 6, 7);
     let file = object::File::parse(&*bytes).unwrap();
     let listed = fixup_sites(&file, &bytes);
-    assert_eq!(listed.coverage, Coverage::DynamicRelocations);
+    assert_eq!(listed.coverage, Coverage::Complete(Source::DynamicRelocations));
     let site = |vma, kind, symbol: Option<&str>, addend, target| FixupSite {
         vma,
         width: 8,
@@ -341,9 +341,52 @@ fn a_relocation_kuna_does_not_apply_is_listed_unvalued() {
 /// `8 * width - 1` words, so a second bitmap continues where the first ended.
 #[test]
 fn relr_entries_decode_to_their_slots() {
-    assert_eq!(relr_decode(&[0x4020, 0x9], 8), vec![0x4020, 0x4038]);
-    assert_eq!(relr_decode(&[0x1000, 0x3, 0x3], 8), vec![0x1000, 0x1008, 0x1008 + 63 * 8]);
-    assert_eq!(relr_decode(&[0x2000, 0x8000_0001], 4), vec![0x2000, 0x2004 + 30 * 4]);
-    assert_eq!(relr_decode(&[0x2000, 0x8000_0001, 0x3], 4), vec![0x2000, 0x2004 + 30 * 4, 0x2004 + 31 * 4]);
-    assert!(relr_decode(&[], 8).is_empty());
+    let decode = |entries: &[u64], width| relr_decode(entries, width, usize::MAX).0;
+    assert_eq!(decode(&[0x4020, 0x9], 8), vec![0x4020, 0x4038]);
+    assert_eq!(decode(&[0x1000, 0x3, 0x3], 8), vec![0x1000, 0x1008, 0x1008 + 63 * 8]);
+    assert_eq!(decode(&[0x2000, 0x8000_0001], 4), vec![0x2000, 0x2004 + 30 * 4]);
+    assert_eq!(decode(&[0x2000, 0x8000_0001, 0x3], 4), vec![0x2000, 0x2004 + 30 * 4, 0x2004 + 31 * 4]);
+    assert!(decode(&[], 8).is_empty());
+}
+
+/// GH #1502: a table that names more slots than the file has words is not a
+/// valid one, so decoding stops at the limit and says so, however many bitmap
+/// words a crafted table repeats.
+#[test]
+fn relr_decoding_stops_at_the_limit() {
+    let bitmaps = vec![u64::MAX; 1 << 16];
+    let (slots, overflow) = relr_decode(&bitmaps, 8, 1000);
+    assert!(overflow && slots.len() == 1000, "{}", slots.len());
+    assert_eq!(relr_decode(&[0x4020, 0x9], 8, 2), (vec![0x4020, 0x4038], false));
+}
+
+fn macho_fixture(name: &str) -> Vec<u8> {
+    std::fs::read(format!("{}/tests/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))).expect("read fixture")
+}
+
+/// The arm64 chained-fixup fixture: every rebase becomes a write holding the
+/// unpacked pointer, and only the `__DATA_CONST` (`SG_READ_ONLY`) slots are
+/// constant: `__objc_classlist[0]` is, the `__DATA` `class_t.isa` slot is not.
+#[test]
+fn macho_chained_rebases_are_written_and_data_const_is_constant() {
+    let bytes = macho_fixture("macho_objc_arm64");
+    let file = object::File::parse(bytes.as_slice()).expect("parse");
+    let r = macho_chained(&file, &bytes);
+    let classlist = r.writes.iter().find(|w| w.vma == 0x100004000).expect("classlist slot");
+    assert_eq!((classlist.value, classlist.width), (0x100008000, 8));
+    let isa = r.writes.iter().find(|w| w.vma == 0x100008000).expect("class_t.isa slot");
+    assert_eq!(isa.value, 0x100008028);
+    assert!(r.const_ranges.contains(&(0x100004000, 0x100004007)));
+    assert!(!r.const_ranges.iter().any(|&(lo, _)| lo == 0x100008000));
+}
+
+/// A classic `LC_DYLD_INFO` Mach-O yields nothing.
+#[test]
+fn macho_chained_inert_without_chained_fixups() {
+    for name in ["macho_objc", "macho_imports"] {
+        let bytes = macho_fixture(name);
+        let file = object::File::parse(bytes.as_slice()).expect("parse");
+        let r = macho_chained(&file, &bytes);
+        assert!(r.writes.is_empty() && r.const_ranges.is_empty(), "{name}");
+    }
 }

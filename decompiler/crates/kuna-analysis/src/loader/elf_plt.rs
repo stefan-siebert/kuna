@@ -88,7 +88,7 @@ fn resolve_from_sections(file: &object::File) -> Vec<PltSym> {
     // by relocations.  It therefore runs its own resolver (`resolve_mips_imports`)
     // *before* the relocation-driven path below, which would otherwise early-return
     // on the empty `build_got_name_map`.  See [`resolve_mips_imports`].
-    if matches!(arch, Architecture::Mips | Architecture::Mips64) {
+    if super::kuna_mipsabi::is_mips(arch) {
         return resolve_mips_imports(file);
     }
 
@@ -129,21 +129,18 @@ fn resolve_from_sections(file: &object::File) -> Vec<PltSym> {
 
     // (kuna) i386-PIE PLT stubs are GOT-relative (`jmp *disp(%ebx)`, `FF A3
     // <disp32>`), so decoding them needs the GOT base that `%ebx` holds at the
-    // call site.  Derive it once (gated by the default-on `i386_pie_plt` option —
-    // angr `test_decompiling_nl_i386_pie`) and thread it to `decode_i386`; `None`
-    // off-i386, with the option off, or when no GOT anchor exists (non-PIC i386),
-    // in which case `decode_i386` decodes only the non-PIC `FF 25 <abs32>` form
-    // exactly as before.
-    let i386_got_base = if matches!(arch, Architecture::I386)
-        && kuna_decomp::kuna_i386_pie_plt::i386_pie_plt_enabled()
-    {
+    // call site.  Derive it once (angr `test_decompiling_nl_i386_pie`) and thread
+    // it to `decode_i386`; `None` off-i386 or when no GOT anchor exists (non-PIC
+    // i386), in which case `decode_i386` decodes only the non-PIC `FF 25 <abs32>`
+    // form exactly as before.
+    let i386_got_base = if matches!(arch, Architecture::I386) {
         i386_got_base(file)
     } else {
         None
     };
 
     for (vma, data, _) in plt_secs {
-        decode_plt_section(arch, vma, data, i386_got_base, &got_to_name, &mut out, &mut named_got);
+        decode_plt_section(file, vma, data, i386_got_base, &got_to_name, &mut out, &mut named_got);
     }
 
     // (kuna ifuncfpret) Name the x86-64 `.plt.sec`/`.iplt` IFUNC (IRELATIVE) stubs
@@ -210,13 +207,7 @@ fn resolve_from_sections(file: &object::File) -> Vec<PltSym> {
 /// this path cannot supply.
 fn resolve_from_dynamic_segment(file: &object::File, bytes: &[u8]) -> Vec<PltSym> {
     let arch = file.architecture();
-    if matches!(
-        arch,
-        Architecture::Mips
-            | Architecture::Mips64
-            | Architecture::PowerPc
-            | Architecture::PowerPc64
-    ) {
+    if super::kuna_mipsabi::is_mips(arch) || matches!(arch, Architecture::PowerPc | Architecture::PowerPc64) {
         return Vec::new();
     }
     let Some(imports) = super::elf_dynseg::dynamic_imports(bytes) else {
@@ -228,9 +219,7 @@ fn resolve_from_dynamic_segment(file: &object::File, bytes: &[u8]) -> Vec<PltSym
 
     // `DT_PLTGOT` *is* `_GLOBAL_OFFSET_TABLE_`, so it is the same anchor
     // [`i386_got_base`] reads off `.got.plt` when the sections are there.
-    let i386_got_base = if matches!(arch, Architecture::I386)
-        && kuna_decomp::kuna_i386_pie_plt::i386_pie_plt_enabled()
-    {
+    let i386_got_base = if matches!(arch, Architecture::I386) {
         imports.pltgot
     } else {
         None
@@ -240,7 +229,7 @@ fn resolve_from_dynamic_segment(file: &object::File, bytes: &[u8]) -> Vec<PltSym
     let mut named_got: HashSet<u64> = HashSet::new();
     for (vma, data) in super::elf_dynseg::exec_segments(bytes) {
         decode_plt_section(
-            arch,
+            file,
             vma,
             data,
             i386_got_base,
@@ -386,7 +375,7 @@ pub(crate) fn strip_version(name: &[u8]) -> Vec<u8> {
 /// Decode every recognizable PLT stub in one `.plt*` section, pushing a
 /// [`PltSym`] for each whose decoded GOT target is in `map` and not yet named.
 fn decode_plt_section(
-    arch: Architecture,
+    file: &object::File,
     vma: u64,
     data: &[u8],
     i386_got_base: Option<u64>,
@@ -394,7 +383,7 @@ fn decode_plt_section(
     out: &mut Vec<PltSym>,
     named_got: &mut HashSet<u64>,
 ) {
-    match arch {
+    match file.architecture() {
         Architecture::X86_64 | Architecture::X86_64_X32 => {
             decode_x86_64(vma, data, map, out, named_got)
         }
@@ -407,7 +396,7 @@ fn decode_plt_section(
             decode_riscv(vma, data, map, out, named_got)
         }
         Architecture::Sparc | Architecture::Sparc32Plus | Architecture::Sparc64 => {
-            decode_sparc(vma, data, map, out, named_got)
+            decode_sparc(vma, data, if file.is_64() { 32 } else { 12 }, map, out, named_got)
         }
         // PowerPC's stubs are not in a `.plt*` *code* section (`.plt` is a NOBITS
         // data table; the call stubs live in `.text`), so they are resolved out of
@@ -479,7 +468,7 @@ fn decode_x86_64(
 ///   (adrp/ldr veneer); naming these stubs lets the no-return pass flag `exit`
 ///   and collapses the spurious fall-through loop (angr
 ///   `test_decompiling_nl_i386_pie`).  `i386_got_base` is `None` when the GOT
-///   base could not be derived or the `i386_pie_plt` option is off, in which case
+///   base could not be derived, in which case
 ///   the `FF A3` form is skipped (byte-identical to the pre-fix behavior); the
 ///   non-PIC `FF 25` arm is unaffected either way.
 fn decode_i386(
@@ -884,48 +873,36 @@ fn decode_ppc64_stubs(
 // SPARC (SPARC v9 / 32-bit, big-endian)
 // ---------------------------------------------------------------------------
 
-/// SPARC PLT import veneer (32-byte entry, big-endian fixed 32-bit insns):
-/// ```text
-///     sethi  %hi(entry_offset), %g1   ; 0x03______  — relocation index marker
-///     b,a    %xcc, <PLT0 resolver>    ; 0x30 6f ____ — branch to the header stub
-///     nop ; nop ; nop ; nop ; nop ; nop
-/// ```
+/// SPARC PLT import veneer (big-endian fixed 32-bit instructions):
+/// ELF32 uses 12-byte entries (`sethi %hi(...),%g1; b,a <resolver>; nop`);
+/// ELF64 uses 32-byte entries (`sethi; b,a %xcc,<resolver>; nop*6`).
 /// Unlike every other arch, SPARC's `.rela.plt` `R_SPARC_JMP_SLOT` relocation
 /// `r_offset` **is the PLT entry address itself** (the linker rewrites the
 /// in-place stub at resolution time — see Ghidra's `SPARC*_ElfRelocationHandler`),
 /// not a separate `.got` slot.  So the "got_slot → name" map ([`build_got_name_map`])
-/// is already keyed on the call target the decompiler sees: the decoder just walks
-/// the section in 32-byte strides and records any entry whose address is a known
-/// symbol-bearing relocation.  The 4-slot (`0x80`-byte) reserved PLT0 header and
-/// the non-symbol `__gmon_start__`/IRELATIVE slots are not relocation keys, so they
-/// fall out of the map automatically (same self-correcting cross-check as the
-/// other arches; here `stub == got`).
+/// is already keyed on the call target the decompiler sees, and the relocation,
+/// not a stride, fixes each entry boundary: the decoder visits every word and
+/// records a `sethi %g1`-headed word whose address is a known symbol-bearing
+/// relocation and which has a complete ABI-sized entry behind it. A window that
+/// starts mid-table (the sectionless `PT_LOAD` scan) therefore finds the same
+/// entries as `.plt`. Reserved PLT0 entries and non-symbol relocations fall out
+/// of the map automatically (here `stub == got`).
 fn decode_sparc(
     vma: u64,
     data: &[u8],
+    entry_size: usize,
     map: &HashMap<u64, Vec<u8>>,
     out: &mut Vec<PltSym>,
     named_got: &mut HashSet<u64>,
 ) {
-    // SPARC `.plt` entries are 32 bytes; the first instruction of an import
-    // veneer is `sethi %hi(...), %g1` (top byte 0x03 big-endian).  Stride by the
-    // 32-byte entry size, and gate on both the `sethi %g1` opcode and the map
-    // membership so a non-PLT section never produces spurious names.
-    const ENTRY: usize = 32;
-    let mut off = 0usize;
-    while off + 4 <= data.len() {
-        // First word, big-endian.  `sethi rd, imm22`: op=00 (bits[31:30]),
-        // op2=100 (bits[24:22]), rd=bits[29:25]; rd==1 (%g1) and op2==0b100 give
-        // the canonical `sethi %hi(...),%g1` = 0x03xxxxxx import-veneer head.
-        let w0 = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+    for (index, entry) in data.windows(entry_size).step_by(4).enumerate() {
+        // `sethi %hi(...),%g1`: op=00, rd=1, op2=100.
+        let w0 = u32::from_be_bytes([entry[0], entry[1], entry[2], entry[3]]);
         let is_sethi_g1 = (w0 >> 30) == 0b00 && ((w0 >> 25) & 0x1f) == 1 && ((w0 >> 22) & 0x7) == 0b100;
         if is_sethi_g1 {
-            let entry = vma.wrapping_add(off as u64);
-            // SPARC: the JMP_SLOT relocation offset == the PLT entry address, so
-            // the stub and the GOT-name-map key are one and the same.
-            record(entry, entry, map, out, named_got);
+            let addr = vma.wrapping_add((index * 4) as u64);
+            record(addr, addr, map, out, named_got);
         }
-        off += ENTRY;
     }
 }
 
@@ -990,16 +967,19 @@ fn resolve_mips_imports(file: &object::File) -> Vec<PltSym> {
 /// marked **constant** so the engine folds the `lw $t9, off($gp)` indirect-call
 /// load to the stub address (the analog of `setConstant` on the GOT pointer
 /// entries in Ghidra's `MIPS_ElfExtension.fixupGot`).  Empty off-MIPS or when the
-/// `DT_MIPS_*` tags are absent.  One slot per external dynamic symbol (FUNC or
-/// not — a constant GOT pointer is harmless for non-FUNC slots and matches
-/// Ghidra, which `setConstant`s every external GOT entry).
+/// `DT_MIPS_*` tags are absent.  One slot per undefined function import that has
+/// a lazy stub. A slot holding 0 belongs to an import with no stub (its address
+/// is taken, or it is a weak reference); the dynamic linker writes the import's
+/// address there at load time, so the 0 is not its value and the slot stays
+/// variable.
 pub(crate) fn mips_got_const_ranges(file: &object::File) -> Vec<(u64, u64)> {
-    if !matches!(file.architecture(), Architecture::Mips | Architecture::Mips64) {
+    if !super::kuna_mipsabi::is_mips(file.architecture()) {
         return Vec::new();
     }
     let ptr = if file.is_64() { 8u64 } else { 4u64 };
     mips_external_got_entries(file)
         .into_iter()
+        .filter(|e| e.stub_addr != 0)
         .map(|e| (e.slot_addr, e.slot_addr.wrapping_add(ptr - 1)))
         .collect()
 }
@@ -1007,6 +987,7 @@ pub(crate) fn mips_got_const_ranges(file: &object::File) -> Vec<(u64, u64)> {
 /// One external-symbol GOT entry on MIPS: the dynsym name, the GOT slot address,
 /// and the slot's static contents (the `.MIPS.stubs` stub address it points at).
 struct MipsExtGot {
+    symbol_index: u64,
     name: Vec<u8>,
     slot_addr: u64,
     stub_addr: u64,
@@ -1053,10 +1034,11 @@ fn mips_external_got_entries(file: &object::File) -> Vec<MipsExtGot> {
             Ok(n) if !n.is_empty() => strip_version(n),
             _ => continue,
         };
-        let got_index = local_gotno + (idx as u64 - gotsym);
-        let slot_addr = got_base.wrapping_add(got_index * ptr as u64);
+        let Some(slot_addr) = local_gotno.checked_add(idx as u64 - gotsym)
+            .and_then(|index| index.checked_mul(ptr as u64))
+            .and_then(|offset| got_base.checked_add(offset)) else { continue };
         let stub_addr = read_word_at_vma(file, slot_addr, ptr, le).unwrap_or(0);
-        out.push(MipsExtGot { name, slot_addr, stub_addr });
+        out.push(MipsExtGot { name, slot_addr, stub_addr, symbol_index: idx as u64 });
     }
 
     out
@@ -1434,7 +1416,7 @@ mod tests {
 
         let mut out: Vec<PltSym> = Vec::new();
         let mut named: HashSet<u64> = HashSet::new();
-        decode_sparc(vma, &data, &map, &mut out, &mut named);
+        decode_sparc(vma, &data, 32, &map, &mut out, &mut named);
 
         // The PLT0 header and the unmapped entry(0) fall out; printf+puts named
         // at their own entry addresses (stub == reloc offset).
@@ -1443,4 +1425,28 @@ mod tests {
         got.sort();
         assert_eq!(got, vec![(entry(1), b"printf".to_vec()), (entry(2), b"puts".to_vec())]);
     }
+
+    #[test]
+    fn sparc32_plt_decode_ignores_window_phase() {
+        // A sectionless PT_LOAD window starts with its segment, 164 bytes before
+        // `.plt` here, so the 12-byte entries do not sit at multiples of 12.
+        let (vma, plt) = (0x2ff60u64, 0x30004u64);
+        let mut data = vec![0u8; (plt - vma) as usize + 48];
+        for (i, hi) in [0x03000030u32, 0x0300003c].into_iter().enumerate() {
+            data.extend_from_slice(&hi.to_be_bytes());
+            data.extend_from_slice(&(0x30bffff3 - 3 * i as u32).to_be_bytes());
+            data.extend_from_slice(&0x01000000u32.to_be_bytes());
+        }
+        let map: HashMap<u64, Vec<u8>> =
+            [(plt + 48, b"puts".to_vec()), (plt + 60, b"printf".to_vec())].into();
+        let mut out: Vec<PltSym> = Vec::new();
+        decode_sparc(vma, &data, 12, &map, &mut out, &mut HashSet::new());
+        let got: Vec<(u64, Vec<u8>)> = out.iter().map(|p| (p.addr, p.name.clone())).collect();
+        assert_eq!(got, vec![(plt + 48, b"puts".to_vec()), (plt + 60, b"printf".to_vec())]);
+    }
+}
+
+/// Dynamic-symbol identities for validating lazy-binding stub instructions.
+pub(super) fn mips_stub_identities(file: &object::File<'_>) -> Vec<(u64, u64)> {
+    mips_external_got_entries(file).into_iter().map(|entry| (entry.stub_addr, entry.symbol_index)).collect()
 }

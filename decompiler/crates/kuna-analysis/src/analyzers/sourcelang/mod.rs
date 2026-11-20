@@ -85,9 +85,16 @@
 //! byte-identical output, and the **ELF path is untouched**.
 
 mod kuna_rustversion;
-pub use kuna_rustversion::stable_rustc_version;
+mod kuna_legacy_llvm;
+pub use kuna_rustversion::{fmt_pieces_layout, rustc_version_label, stable_rustc_version};
+mod kuna_rustreleases;
+mod kuna_rustcrates;
+pub use kuna_rustcrates::registry_crates;
 mod kuna_rustformatters;
-pub use kuna_rustformatters::{integer_formatters, primitive_display_formatters};
+mod kuna_rustfmtstr;
+mod kuna_rustfmtwrite;
+mod kuna_rustfmtio;
+pub use kuna_rustformatters::{formatter_metadata, integer_formatters, primitive_display_formatters, FormatterMetadata};
 
 use object::macho::{MachHeader32, MachHeader64};
 use object::read::macho::{
@@ -103,7 +110,7 @@ use object::{BinaryFormat, Endianness, FileKind, SymbolKind};
 /// reports [`Compiler::Rustc`].
 const RUST_NORETURN_LIST: &str = include_str!("../../../data/RustFunctionsThatDoNotReturn");
 
-/// The Golang no-return list, vendored verbatim from Ghidra
+/// The Golang no-return list, adapted from Ghidra
 /// `Ghidra/Features/Base/data/GolangFunctionsThatDoNotReturn` (the
 /// `compiler id="golang"` arm of `noReturnFunctionConstraints.xml`). Applied
 /// **in addition** to `ElfFunctionsThatDoNotReturn` when [`detect_compiler`]
@@ -244,11 +251,11 @@ impl Compiler {
     }
 }
 
-/// The compiler verdict every consumer should act on: the `KUNA_SOURCELANG`
-/// override when the environment carries one (`option sourcelang`, set by the
-/// CLI before `load file` so it reaches pass selection), else detection.
+/// The compiler verdict every consumer should act on: the load's forced
+/// `sourcelang` when it has one (`LoadOptions::sourcelang`, or the
+/// `KUNA_SOURCELANG` the CLI sets before `load file`), else detection.
 pub fn effective_compiler(file: &object::File, bytes: &[u8]) -> Compiler {
-    match kuna_decomp::kuna_sourcelang::forced_from_env() {
+    match kuna_decomp::kuna_sourcelang::forced() {
         Some(lang) => Compiler::from_forced_lang(lang),
         None => detect_compiler(file, bytes),
     }
@@ -256,7 +263,7 @@ pub fn effective_compiler(file: &object::File, bytes: &[u8]) -> Compiler {
 
 /// [`effective_compiler`] over raw image bytes (the `load file` entry point).
 pub fn effective_compiler_bytes(bytes: &[u8]) -> Compiler {
-    match kuna_decomp::kuna_sourcelang::forced_from_env() {
+    match kuna_decomp::kuna_sourcelang::forced() {
         Some(lang) => Compiler::from_forced_lang(lang),
         None => detect_compiler_bytes(bytes),
     }
@@ -555,7 +562,7 @@ fn any_record_opens_with(blob: &[u8], needle: &str) -> bool {
 }
 
 /// `true` if any symbol name is a Rust-mangled symbol: the v0 scheme (`_R...`) or
-/// the legacy scheme (`_ZN...17h<16 hex>E`). This is the mangled-symbol heuristic
+/// the legacy scheme (`_ZN...17h<16 lowercase hex>E`). This is the mangled-symbol heuristic
 /// — robust on a non-stripped Rust binary even when the `.comment` record was
 /// removed, and **format-neutral** (`file.symbols()`/`dynamic_symbols()` work for
 /// ELF/PE/Mach-O alike), so it is the shared Rust signal every format arm uses.
@@ -589,8 +596,7 @@ pub fn detect_compiler_bytes(bytes: &[u8]) -> Compiler {
 /// - **v0**: `_R<path>` (or `__R<path>` with a platform leading underscore),
 ///   parsed against the scheme's grammar — the prefix alone is not evidence.
 /// - **legacy**: `_ZN...17h<hex16>E` — the Itanium-`_ZN` form rustc emits with a
-///   trailing 16-hex-digit `17h…` hash component, which distinguishes it from a
-///   plain C++ `_ZN…` symbol.
+///   trailing `17h…` hash component containing 16 lowercase hex digits.
 ///
 /// Format-agnostic, for a caller holding a bare name (the demangle pass). Where
 /// the object format is known, use [`is_rust_mangled_in`].
@@ -634,10 +640,12 @@ fn is_rust_legacy(name: &str) -> bool {
     let Some(pos) = name.rfind("17h") else {
         return false;
     };
-    let Some(hex) = name[pos + 3..].strip_suffix('E') else {
-        return false;
-    };
-    hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    name[pos + 3..].strip_suffix('E').is_some_and(is_legacy_rust_hash_digits)
+        || kuna_legacy_llvm::stem(name).is_some()
+}
+
+pub(crate) fn is_legacy_rust_hash_digits(hex: &str) -> bool {
+    hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// `true` if the `.rodata` section carries any [`RUST_SIGNATURES`] byte signature
@@ -669,23 +677,27 @@ pub fn swift_section_present<'a>(names: impl Iterator<Item = &'a str>) -> bool {
 
 /// `true` if `name` is a Swift-mangled symbol: the Swift 5 `$s`/`$S` scheme or
 /// the Swift 4 `_T0` scheme, each with an optional platform leading underscore
-/// (Mach-O spells them `_$s…`/`__T0…`).
+/// (Mach-O spells them `_$s…`/`__T0…`), or an Objective-C runtime type name in
+/// the Swift 3 `_Tt` scheme (`_TtC6Sample3Foo`, the form the ObjC metadata
+/// carries for Swift classes and protocols).
 ///
-/// The prefix is held to the scheme's own next token — an identifier length, a
-/// known-type shortcut, or the stdlib module contraction — so an assembler
-/// local like `$LN3` or a C `_T0mumble` cannot claim the image. No other
+/// The prefix is held to the scheme's own next token — an operator or
+/// identifier length — so an assembler local like `$LN3` or a C `_T0mumble`
+/// cannot claim the image. No other
 /// toolchain emits `$s`-namespace symbols, which keeps a one-symbol test as
 /// safe as the Rust v0 grammar parse.
 pub fn is_swift_mangled(name: &str) -> bool {
     let bare = name.strip_prefix('_').unwrap_or(name);
     if let Some(rest) = bare.strip_prefix("$s").or_else(|| bare.strip_prefix("$S")) {
-        return rest
-            .bytes()
-            .next()
-            .is_some_and(|b| b.is_ascii_digit() || b.is_ascii_uppercase() || b == b's');
+        return rest.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_');
     }
     if let Some(rest) = bare.strip_prefix("_T0").or_else(|| name.strip_prefix("_T0")) {
         return rest.bytes().next().is_some_and(|b| b.is_ascii_digit() || b.is_ascii_uppercase());
+    }
+    if let Some(rest) = name.strip_prefix("_Tt") {
+        let mut b = rest.bytes();
+        return matches!(b.next(), Some(b'C' | b'V' | b'O' | b'P' | b'G'))
+            && b.next().is_some_and(|c| c.is_ascii_digit() || matches!(c, b'C' | b'V' | b'O' | b'P' | b'G' | b'S' | b's' | b'E'));
     }
     false
 }
@@ -1027,11 +1039,17 @@ mod tests {
             // Swift 4 scheme.
             "_T04main5helloyyF",
             "__T04main5helloyyF",
+            // ObjC runtime type names (Swift 3 scheme).
+            "_TtC6Sample3Foo",
+            "_TtCC6Sample5Outer5Inner",
+            "_TtP6Sample5Proto_",
+            "_TtGC7SwiftUI19UIHostingControllerVVS_7TabItem8RootView_",
+            "_TtCs12_SwiftObject",
         ] {
             assert!(is_swift_mangled(name), "{name} is Swift-mangled");
         }
-        // Assembler locals, plain C names, and `$`/`_T0` with no mangling body.
-        for name in ["$LN3", "_$LN3", "main", "_Runtime", "$", "_T0", "_T0mumble", "_RNvCs1234_4core5panic"] {
+        // Assembler locals, plain C names, and `$`/`_T0`/`_Tt` with no mangling body.
+        for name in ["$LN3", "_$LN3", "main", "_Runtime", "$", "_T0", "_T0mumble", "_RNvCs1234_4core5panic", "_Tt", "_TtX", "_Ttable"] {
             assert!(!is_swift_mangled(name), "{name} is not Swift-mangled");
         }
     }

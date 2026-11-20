@@ -5,6 +5,7 @@
 
 pub mod funcdata_resolveflow;
 pub mod flow;
+pub mod kuna_ppc32piccalls;
 pub mod kuna_armflowcontext;
 pub mod jumptable;
 pub mod kuna_emulatefunction;
@@ -28,6 +29,7 @@ pub mod kuna_loweredswitchheads; // (kuna) try a lowered-switch cascade behind e
 pub mod kuna_noreturn_externmatch; // (kuna) angr incorrect-duplication-chcon: name-matched extern no-return
 pub mod kuna_noreturnextern; // (kuna) angr tail-tail-bytes-ret-dup: undefined-extern name-based no-return
 pub mod kuna_tailcalljump;
+pub mod kuna_gottailcall; // (kuna) a one-destination computed jump to a function is a tail call when the call loses nothing
 pub mod kuna_funcboundflow; // (kuna) bound fall-through at a known function entry (no cross-function merge)
 pub mod kuna_mappedflowboundary;
 pub mod kuna_tailcallframe; // (kuna) recover a frame-teardown tail jump whose callee was never discovered
@@ -42,15 +44,36 @@ pub mod kuna_cortexmpriv; // (kuna) fold the Cortex-M isCurrentModePrivileged() 
 pub mod kuna_cleanupcode; // (kuna) oxidizer CleanupCodeRemover: delete rust drop/dealloc call sites
 pub mod kuna_gomorestack; // (kuna) fold the Go stack-growth entry guard (docs/multilang.md W2)
 pub mod kuna_gowritebarrier; // (kuna) fold the Go GC write-barrier diamond (docs/multilang.md W2)
+pub mod kuna_ptrauthtrap; // (kuna) drop the arm64e pointer-auth failure checks
 pub mod kuna_linuxsyscall; // (kuna) name the 32-bit Linux int 0x80 sites instead of calling through swi()
 pub mod kuna_x64syscall; // (kuna) give the x86-64 SYSCALL user-op the Linux ABI register effects
 pub mod kuna_syscallregs; // (kuna) give the ARM/AArch64/RISC-V/MIPS/PowerPC system-call user-op its register effects
 pub mod kuna_msvcstrappend; // (kuna) collapse an inlined MSVC std::string push_back/append diamond into one call
 pub mod kuna_fastfailnoreturn; // (kuna) a Windows `int 0x29` (__fastfail) ends the flow instead of unbalancing the stack
 pub mod kuna_msvcimportcall; // (kuna `msvcsig`) a call through an import slot with a locked MSVC prototype is direct from the flow on
+pub mod kuna_mipsunaligned; // (kuna) lift a MIPS lwl/lwr-style unaligned pair as one whole access
+pub mod kuna_memtag; // (kuna) lift the AArch64 memory-tagging instructions with their tag effect
 pub mod kuna_int3pad; // (kuna) name the int3 pad control ran into instead of printing it as a call through swi()
+pub mod kuna_brktrap; // (kuna) an AArch64 brk compiler trap ends the flow instead of returning through SoftwareBreakpoint
+pub mod kuna_kernelbug; // (kuna) a Linux kernel __bug_table trap prints as BUG() or __WARN(file,line)
 pub mod kuna_decodehalt; // (kuna) a halt planted where the decode failed says so instead of printing as an ordinary return
 pub mod kuna_fpuemu; // (kuna) decode the 8087 emulator's INT 34h-3Dh as the x87 instructions they stand for
 pub mod kuna_jumptablefault; // (kuna) test-only: panic one function's jump-table recovery
 
 pub mod kuna_gojumpchain;
+pub mod kuna_returnbranch;
+
+pub mod kuna_rustprobestack;
+pub mod kuna_chkstkdarwin; // (kuna) remove the Darwin AArch64 stack probe so the registers it preserves survive it
+
+pub(crate) mod kuna_highslice_guard;
+pub mod kuna_calleeoverride; // (kuna) a caller-stated destination for an indirect call
+pub mod kuna_stubtailcall; // (kuna) a loader-proven lazy-binding stub flows as a tail call
+
+pub mod kuna_ppcpcread;
+
+pub mod kuna_indirectreturn;
+
+pub mod kuna_nullable_reloc;
+
+pub(crate) mod kuna_atomicxadd;

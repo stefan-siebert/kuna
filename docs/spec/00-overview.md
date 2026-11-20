@@ -218,6 +218,23 @@ simultaneous ingests have independent member files. Non-object members are
 still skipped, bootstrap failures retain the archive/member warning, and
 record order and cross-input deduplication remain unchanged.
 
+Archive inputs to the image commands are settled before dispatch by
+`decompiler/crates/kuna-cli/src/armember.rs (resolve)`. An argument that names
+an `ar` archive, alone or as `lib.a:NAME`, is replaced by the path of one
+member: the one `--member NAME` or the `:NAME` suffix names, else the only
+object member, else the only object member defining a symbol that another
+argument spells (a Mach-O name also matches without its leading underscore).
+Any other case is a usage error listing the object members. A name stored
+more than once is selected as `NAME#K`, its K-th occurrence, and an argument
+that is an existing file is never split at a `:`. The member is written under
+an owned temporary directory that is removed when the command returns; a thin
+archive's member is named in place, resolved against the archive's directory,
+and must be a regular file (read on demand, one at a time), with a `note:`
+when its path leaves that directory. `--member` with no name prints the member
+list, and `functions` with no member re-runs itself once per object member
+(`--member=NAME`) and joins the listings with a `member:` prefix on each name.
+Commands never see the archive, so a member loads exactly as its `.o` does.
+
 Text decompilation owns its C and optional region-output files for the entire
 console run, including a discovery retry. Each file is privately created and
 its initial writing handle is closed before launching the console. Scope exit
@@ -298,6 +315,25 @@ Four front-ends drive one engine assembly:
   because there it changes no-return facts and therefore emitted C, never the
   entry set. An explicit `--option`, and any preset that names one of these
   options, still wins on either surface.
+
+  The `--json` record is one shape for `decompile-all` and `kuna decompile`,
+  which renders its one function through the same serializer
+  (`decompiler/crates/kuna-cli/src/decompile_all.rs (result_json)`). A caller can
+  narrow it with `--omit` (`decompiler/crates/kuna-cli/src/decompile_all/omit.rs`):
+  each named collection (`aliases`, `line_mappings`, `variables` with
+  `stack_objects`, `types`) is absent from every record and listed in a
+  top-level `omitted`, so absence is never read as an examined empty
+  collection; a document that omits
+  nothing carries no `omitted` key and is byte-identical to one rendered without
+  the flag. The omission reaches the decompile loop, not just the serializer:
+  `--omit variables` skips the variable and stack-object extraction exactly as
+  `--no-vars` does, and the markup render behind the line mappings and the
+  variables' line evidence (`print_c_with_provenance`) runs only when one of the
+  two is still wanted (`decompile_all.rs (Args::wants_provenance)`). `code` is
+  the plain render in every case, so it does not change. `aliases` names no
+  decompile work: the list is an inventory fact gathered at load time, so
+  omitting it only shrinks the record of an entry exporting hundreds of names,
+  which keeps its primary `name` and address.
 
   The full callable-symbol inventory these surfaces share is
   `decompiler/crates/kuna-console/src/engine.rs (ConsoleProgram::function_entries_canonical)`,
@@ -492,7 +528,7 @@ Four front-ends drive one engine assembly:
   `Selected entry has no mapped bytes`; a later byte-load error while decoding
   a mapped entry also remains a failure, as it does in JSON output. Because that
   probe reads through the loader's 512-byte staging window, an unmapped address
-  just past mapped bytes can pass it; on a `mappedflowboundary` image it then
+  just past mapped bytes can pass it; on a mapped-flow-boundary-eligible image it then
   fails in the checked decode with `Instruction bytes at <addr> are not mapped`,
   while an address far from any segment is refused by the CLI selector with
   `address <addr> is not mapped in this input`. A PE IAT slot
@@ -547,14 +583,14 @@ Four front-ends drive one engine assembly:
   (`decompiler/crates/kuna-analysis/src/loader/kuna_dynrelocs.rs (fixup_sites)`):
   its kind (`rebase`, `bind`, `relocation`), the symbol a bind names, the value
   the loader stores where the image determines it, the file's bytes and the
-  image's. What the listed bytes are there is decided by comparing the two, so it
-  holds with `dynrelocs` off too: the file's when they agree (also where the file
+  image's. What the listed bytes are there is decided by comparing the two: the
+  file's when they agree (also where the file
   already holds the loader's value, as a GNU ld x86-64 `RELATIVE` slot or a `REL`
   or `RELR` one does), kuna's zero placeholder for an unvalued bind whose image
   bytes are zero, and the loader's value otherwise. A span that overlaps anything
   but a rebase whose bytes already are its target also gets one note, on stderr
   and in the JSON `notes`, naming up to three slots; a rebase that still holds its
-  chain word or a `RELA` zero (`dynrelocs` off) is named, since those bytes are
+  chain word or a `RELA` zero is named, since those bytes are
   not the pointer. A relocatable object lists no slots (coverage `none`) although
   its bytes are kuna's relocated layout of it.
 
@@ -1031,6 +1067,17 @@ Compiler diagnostics for a constructor resolve its stored source-file index
 and line number. Consistency checks and section finalization share this lookup,
 so included-file diagnostics keep the constructor's location after parsing
 returns to the parent file. No separate constructor-location map is maintained.
+
+Constructor patterns are built one operand at a time, in operand order, and an
+operand whose disassembly action is a bare operand (`[ idx = fld; ]`) takes
+that operand's pattern. When the named operand is the operand itself
+(`[ idx = idx; ]`) or comes later in the order, its pattern does not exist yet,
+so the compiler rejects the constructor with
+`idx: operand is defined as itself or an operand that follows it`, as Ghidra's
+compiler does with `operand idx has an issue`. Listing the source operand first,
+or writing an expression such as `fld + 0`, compiles
+(`decompiler/crates/kuna-sleigh/src/slghsymbol.rs (build_constructor_pattern)`,
+`decompiler/crates/kuna-sleigh/src/slghpatexpress.rs (gen_min_pattern)`).
 
 The consistency checker rejects a temporary that is read exactly once and
 written exactly once in the same semantic section when the read precedes or
@@ -1522,12 +1569,14 @@ printf-heavy whole binary (DIV-66). That cost is the reason the typing now
 happens at load instead, and the reason `full` — the loop — remains a per-run
 opt-in rather than the default.
 
-The step's last drive answers for a function decompiled alone (`callerreads`,
+The step's last drive checks raw caller reads (`kuna_callerreads.rs`,
 chapter [04](04-calls-and-prototypes.md)): when the finished function returns
 `void` and a direct caller reads one of its return registers after the call, the
 step forces that return and drives the function once more, keeping the redo only
-when it returns a value. A batch skips it, since the callers it decompiles settle
-the same question.
+when it returns a value. Only the callee-first driver with a built call graph
+delegates this question to its return settling pass. A batch that visits its
+selection in ordinary order uses the same raw caller evidence as a single
+function, even when the caller is outside the selection.
 
 (kuna) **Surface defaults.** The drivers inject their defaults before the option
 pass, from one shared table
@@ -1606,7 +1655,15 @@ range heritage's guard placement visits and before each
 address the written-slot guard guards, every 256 new values a pointer walk of
 `stackstoreguard` visits, every 64 steps of a variable-merging pass
 (`decompiler/crates/kuna-decomp/src/p6_variables/merge.rs (Merge::budget)`,
-chapter 06), before each region attempt of region identification (chapter
+chapter 06), every 1024 seeds the implied-variable walk visits
+(`decompiler/crates/kuna-decomp/src/p6_variables/coreaction_cleanup.rs
+(MARK_IMPLIED_PROBE_STRIDE)`), every 256 Varnodes the dead-code sweep visits
+(`decompiler/crates/kuna-decomp/src/p9_emit/coreaction_render.rs
+(SWEEP_DEADLINE_STRIDE)`: destroying a dead operation unlinks it from each
+input's reader list, which is linear in that list, so a function whose dead
+operations all read one Varnode sweeps in quadratic time and the sweep stops
+where the budget ends, leaving the rest of the dead operations in place),
+before each region attempt of region identification (chapter
 07), before each call-argument trial `ActionActiveParam` scores and every 256
 steps of the trial's use walks (chapter 04), and again after the final layout checks: the drive
 publishes its deadline to
@@ -1616,7 +1673,13 @@ jump-table recovery probes it too, before and after each table's attempt and
 after its basic and default-path models (`decompiler/crates/kuna-decomp/src/p2_lift/flow.rs
 (FlowInfo::recover_jump_tables)`, `decompiler/crates/kuna-decomp/src/p2_lift/jumptable.rs
 (JumpTable::recover_model)`); a table reached past the deadline is not attempted
-and its indirect jump is truncated as an unrecovered one. On expiry the
+and its indirect jump is truncated as an unrecovered one. Inside a model, every
+loop over the values of the switch variable (building the address table,
+checking its rows against the guards, labelling them) advances through
+`decompiler/crates/kuna-decomp/src/p2_lift/jumptable.rs (walk_within_budget)`,
+which fails the walk once a probe sees the budget spent, so a table of any
+length the `jumptablemax` ceiling admits ends with its drive instead of after
+its last row. On expiry the
 containers stop scheduling work and unwind; the driver converts that into the
 function's `error` record (a pass panic after the deadline passed reports the
 same budget error) and the batch continues. The record names where the budget
@@ -1627,7 +1690,8 @@ running when the deadline passed — an action (a rule pool adds the rule that
 applied most since the function's reset, `decompiler/crates/kuna-decomp/src/infra/action.rs
 (ActionPool::budget_site)`), heritage, variable merging, region identification,
 region structuring, `action activeparam`'s trial scoring, a
-store-reachability walk or a jump-table step. A walk that recurses too often
+store-reachability walk or a jump-table step (`jump-table value walk` for
+the loop over a table's values). A walk that recurses too often
 to read the clock at each step probes through
 `decompile_drive.rs (budget_probe)`, which reads it every 256th call and,
 once it has seen the budget spent, answers at once for the rest of the drive;
@@ -1646,7 +1710,24 @@ follow still running when either runs out fails the load with that one's
 error, whose site is `flow following` unless a probe inside the follow (a
 jump-table step) named one, which `kuna decompile` reports as the function's failure, so a
 truncated IR is never adopted, and the drive that adopts a completed one arms
-its own, measuring from where the follow left the resident set. The follow
+its own, measuring from where the follow left the resident set. Its clock is
+charged for the follow: the IR carries how long the follow took
+(`decompiler/crates/kuna-decomp/src/substrate/funcdata.rs (Funcdata::flow_spent)`)
+and the adopting drive's deadline is that much nearer, so `kuna decompile`'s
+budget bounds the follow and the analysis together, as a `decompile-all`
+drive's does. A `decompile` that rebuilds the flow instead (a console fact
+between the two commands, `formatstring full`) follows it again inside its
+own drive and is not charged for the load's follow. When the adopting drive
+stops at its budget or memory limit,
+the console keeps for `print C`'s failure shell a function it builds without
+following the flow again (`decompile_drive.rs (budget_stop_shell)`): that
+follow, every jump-table recovery included, would run past the limit that
+stopped the drive, and the shell prints nothing it adds. A later command that
+reads the IR — `print raw` and the `region` commands, which `kuna decompile
+--raw` / `--regions` run — follows it then, unbudgeted, so it prints the raw
+p-code and regions it printed when the stop followed again at once
+(`decompiler/crates/kuna-console/src/ifacedecomp.rs
+(IfaceDecompData::follow_stopped_flow)`). The follow
 recovers every jump table, and a jump table's sub-pipeline heritages
 everything flow has reached, so in a huge function the follow is where the
 memory goes.
@@ -1654,8 +1735,9 @@ memory goes.
 same probes with a memory limit
 (`decompiler/crates/kuna-decomp/src/infra/kuna_fnmemory.rs`): the driver sets
 it process-wide, each drive reads the resident set it starts from (first
-releasing free heap pages with glibc `malloc_trim` and reading again when it
-starts within a tenth of the limit), and
+releasing free heap pages with glibc `malloc_trim` and reading again when the
+process holds 16 MiB more than the last release left,
+`kuna_fnmemory.rs (settle)`), and
 `decompiler/crates/kuna-decomp/src/infra/decompile_drive.rs (budget_spent)` —
 the one test every probe makes — also asks, reading the resident set at most
 every 50 ms, whether the process is over the limit and the drive itself has
@@ -1669,7 +1751,37 @@ which were otherwise kept for every call site of every function; an inlined
 callee's handles pass to the function it is inlined into, whose cloned call
 ops still name them
 (`decompiler/crates/kuna-decomp/src/p2_lift/flow.rs (FlowInfo::inline_flow)`), and the
-per-callee summaries a run caches are stored compactly (04, `calleedeadarg`). A drive armed only by the limit
+per-callee summaries a run caches are stored compactly (04, `kuna_calleedeadarg.rs`).
+The allocator keeps a function's freed working memory resident, so without
+a release a batch would start every later function at the high-water of the
+largest one before it, and the pages a function cannot reuse would count as
+its growth. With no explicit limit (the cgroup default, or none) the drive
+start releases them once the process holds 64 MiB more than the last release
+left, at most one part in 32 of the time since the last release
+(`kuna_fnmemory.rs (release_due)`), which also returns them to the rest of
+the machine. A rule object outlives the function it ran on, so
+`RuleMultiCollapse` cuts its witness table back at each reset (03). The
+callee-first driver holds every result until its last round has run: it
+writes each one, in a `--jobs` worker's result record, to an anonymous
+temporary file and reads it back when a round or the final document needs it
+(`decompiler/crates/kuna-cli/src/decompile_all/result_store.rs (ResultStore)`),
+falling back to the encoded record in memory when the file cannot be made or
+written; after a failed write the file is only read, so the records already
+on it stay readable.
+It also drops the call graph, and with it the reference index, before its
+first decompile and returns the freed pages: only the plan and the callback
+park read the graph, and the park's answers about the targets are taken up
+front (`decompiler/crates/kuna-cli/src/callgraph.rs (CallGraph::callback_refs)`).
+On serde-hkx's `hkxc.exe` that is 242 of the 312 MiB of heap the first
+function started with, leaving about what a `--jobs` worker starts with.
+The `decompile-all --json` document is written to stdout a record at a time
+(`decompiler/crates/kuna-cli/src/decompile_all.rs (write_selected_json)`), so
+neither it nor the value tree it is rendered from is held whole beside the
+results; built whole, the two took about four times the document's size at
+the end of the run. The release at a drive's start uses glibc's `malloc_trim`
+and happens only on Linux with glibc; elsewhere the drive starts from the
+resident set the allocator left.
+A drive armed only by the limit
 gets a deadline a year out so the probes run. The trip holds for the rest of
 the drive, the function's `error` names the limit, and the drive releases free
 heap pages on the way out. Without the flag, a process under a finite cgroup
@@ -1686,10 +1798,9 @@ floor: the margin, or half the room the cap left the process when the drive
 started if that is less, and never under 64 MiB (`kuna_fnmemory.rs
 (cgroup_trips)`). The room term is what keeps a runaway under a small cap
 from reaching the cap before the floor. The cgroup files are read only on a
-sample that finds the drive grown that much, and a drive that starts within
-a tenth of the tightest limit first releases free heap pages, as under an
-explicit limit. A fixed per-process share of the cap would stop functions the
-container could have held while the other workers were small; the shared
+sample that finds the drive grown that much. A fixed per-process share of
+the cap would stop functions the container could have held while the other
+workers were small; the shared
 budget stops only a function that has grown by the floor while the container
 is inside its margin. Inside that band the stop is a judgment: a function
 that grew by the floor while other workers filled the container can be
@@ -1732,7 +1843,18 @@ asks the ledger which names have been superseded and decompiles again, once,
 exactly the results that spell one. The default callee-first order
 (`protoorder`, chapter [04](04-calls-and-prototypes.md)) runs the same sweep at
 its end, in its own plan order
-(`decompiler/crates/kuna-cli/src/decompile_all/callee_first.rs (converge_callee_first)`).
+(`decompiler/crates/kuna-cli/src/decompile_all/callee_first.rs (converge_callee_first)`),
+and within a budget: a redo costs what the function's first decompile cost, so
+the redos are admitted shortest first, charged the lines each first body
+printed, up to 5% of what the whole first pass printed or 2,000 lines,
+whichever is more
+(`decompiler/crates/kuna-cli/src/decompile_all/callee_first.rs (STRUCT_SWEEP_BUDGET_PCT)`),
+and a body of at most 32 lines is always admitted. A function the budget does
+not reach keeps its first body, whose superseded structure is still defined and
+still answers for it. Every other binary measured redoes under 2,000 lines, so
+the budget reaches only outliers: an AutoIt-compiled 1.2 MB image names
+superseded `this` records in 37 bodies of about 1,500 lines, the interior
+entries of one interpreter routine, and redoing them took a fifth of its run.
 
 (kuna) **A result read from a `void` function.** After each function of the
 callee-first plan, the driver decompiles again every function recovered `void`
@@ -2256,7 +2378,8 @@ from the address width for a small size, and keys the name with `as` so a
 declaration that gives a name but no extent cannot have its name read as the end
 address. The CLI flag is `--define-function <start[-end][=name] | @file>`
 (`decompiler/crates/kuna-cli/src/funcdecl.rs`), repeatable, honored by
-`decompile`, `decompile-all`, `functions`, `decompile-project` and `disassemble`.
+`decompile`, `decompile-all`, `functions`, `decompile-project`, `decompile-graph`,
+`disassemble`, `read` and `raw-pcode`.
 `end` is exclusive. The script surface emits the console command AFTER `read
 symbols` and BEFORE the load, and the in-process surfaces apply the declarations
 after `commit_pending_analysis`
@@ -2264,6 +2387,35 @@ after `commit_pending_analysis`
 declaration is applied after discovery has had its say, because it is an assertion
 that outranks it. Durability is caller-carried — the `@file` form is the artifact,
 and kuna does not write boundaries back into the image.
+
+(kuna, issue #1438) **A declaration the image does not map** is still honored:
+the entry enumerates, resolves by name and names its call sites, which is what a
+routine in a boot ROM or another module, called at a fixed address, needs. What
+a declaration cannot supply is bytes, so `declare_function` measures each one
+when it is made against the loader's shared byte map — the map the lifter refuses
+unmapped instructions by, rather than a staged `load_fill`, which can answer out
+of a padded window — over `[start, end)`, or the entry byte alone when no end was
+given (`decompiler/crates/kuna-console/src/kuna_declaredbytes.rs`). A segment the
+image declares inaccessible (a Mach-O segment with no initial protection, such as
+`__PAGEZERO`, which the byte map serves as zero fill) is not counted, and neither is
+the last byte of the address space, which ends no half-open extent and which the
+lifter never treats as mapped. A loader with
+no shared map is asked through its section table, and one with neither through a
+probe of the entry. The outcome is `mapped`, `partial` (the entry is mapped and
+the extent runs past the mapped bytes; the first unmapped byte is kept) or
+`unmapped` (the entry itself is not mapped), stored beside the declared extent
+and read back as one sentence per declaration that is not `mapped`
+(`decompiler/crates/kuna-console/src/engine.rs (ConsoleProgram::declaration_notes)`).
+Every surface says it the same way: the in-process ones print each sentence as a
+`warning:` once per process right after the declarations are applied (a `--jobs`
+worker, which loads the same declarations, prints nothing), the console's
+`function bounds` writes it to the transcript, from which the script surface
+relays it, and the `--json` documents carry it in a run-level `notes` array and
+put a `declared: {bytes}` object on each declared entry's record. Both keys are
+absent from a run that declared nothing, so its documents are unchanged. Nothing
+about the decompile changes: an unmapped entry is still refused by the command
+that needs its bytes, and a partial extent still bounds flow where it was
+declared to end.
 
 (kuna) **Caller assertions (`--assert`).** Declared boundaries are one fact an
 agent can state; the assertion plane is the rest of them. Everything the engine
@@ -2291,8 +2443,12 @@ lowering) and applied by
 | `return [<func>::]<storage> <C typedeclaration>` | `map return` | P4 prototype-source |
 | `comment [<func>::]<addr> <text>` | `comment instruction` | P9 external-refinement |
 | `flow [<func>::]<addr> branch\|call\|callreturn\|return` | `override flow` | P2 flow-classification |
+| `callee [<func>::]<callsite> <name\|address>` | `override indirect` | P2 flow-classification |
+| `callproto [<func>::]<callsite> <C declaration>` | `override prototype` | P4 prototype-source |
 | `name [<func>::]<symbol> <newname>` | `rename` | P9 naming-policy |
 | `type [<func>::]<symbol> <C type>` | `retype` | P5 type-propagation |
+| `format [<func>::]<addr> hex\|dec\|oct\|bin\|char [<value>]` | `force constant` | P9 literal-format |
+| `isolate [<func>::]<symbol>` | `isolate` | P6 merge-aggressiveness |
 | `readonly <addr>+<size>` | `readonly` | P1 code-data-partition |
 | `volatile <addr>+<size>` | `volatile` | P1 code-data-partition |
 | `bytes <addr> <hex\|@FILE>` | `override bytes` | P1 code-data-partition |
@@ -2343,7 +2499,8 @@ file. **Program-scoped** directives (`function`, `typedef`, `prototype`,
 (`ConsoleProgram::set_assertions` + `assertions::apply_program_scoped`, called
 from `decompiler/crates/kuna-cli/src/decompile_all.rs (load_program)`), for the
 same reason a declared boundary is: an assertion outranks discovery.
-**Function-scoped** directives (`param`, `return`, `comment`, `flow`) become
+**Function-scoped** directives (`param`, `return`, `comment`, `flow`,
+`callproto`) become
 decompile SEEDS (`assertions::function_seed`), because a prototype fact is
 consumed at flow time and cannot be applied afterwards. **Symbol-scoped** directives (`name`,
 `type`) can only be applied to an already-decompiled function — the local they
@@ -2356,6 +2513,40 @@ the function, so every run without one costs exactly what it did before. The
 script surface (`decompiler/crates/kuna-cli/src/decompile/script.rs (build_script_for_input)`)
 emits the same facts at the same three slots, with the same conditional second
 `decompile`.
+
+(kuna) **`callproto` states the prototype of one call instruction.** A
+`prototype` describes a function and reaches a call through the callee's symbol;
+a call through a pointer or a register has no such symbol, and a variadic
+callback takes different arguments at each call, so the only place the fact can
+be stated is the call itself. The engine has carried that store since the port
+(`Override::insert_proto_override`, consumed by `FlowInfo::build_call_specs`
+when the call spec is created), reachable only from the console's `override
+prototype`. `decompiler/crates/kuna-console/src/kuna_callproto.rs` is the one
+parser both surfaces use: the declaration is the grammar `prototype` takes, the
+trailing `;` is optional, and a parameter may be followed by `@<storage>` in
+the spelling `param` takes, which rides in the pieces' `input_storage` so the
+model places the remaining parameters around it; a `@<storage>` after the
+parameter list is the return's `output_storage`. The override is built under
+the default model (`build_override_proto`; the pieces carry no model), so a
+declaration naming any other calling convention (`__thiscall`) is rejected
+rather than laid out under the wrong one, while an alias of the default model
+with the same `this` handling (`<modelalias>`: `__cdecl` on x86-64 Windows) is
+the default under another name and is accepted; `@<storage>` states a
+non-default placement.
+Two directives for the same call site keep the later one, and the earlier
+reports `rejected` (`assertions::restated_call_prototypes`, used by both
+surfaces). The in-process surface seeds
+the pieces as the drive's per-call-site overrides (`FunctionSeed::proto_overrides`),
+where a stated one outranks a format-string one discovered at the same address,
+and the script surface lowers to `override prototype` in the function slot. A
+call site is an address at which the followed function has a call spec, which
+includes a tail jump treated as a call; any other address is rejected with `No
+call is made at this address` — by the console command on the script surface,
+and by `assertions::record_unbound_call_prototypes` against the decompiled
+function on the in-process one. Like `flow`, the directive withdraws the
+`callwide` whole-image proof, which did not see it. A stated prototype locks
+the call's inputs, and `calltargettype` (chapter 05) still gives the target of
+such an indirect call the stated type, so the call stays one C can make.
 
 (kuna) **A symbol-scoped directive reaches the register locals too, by mapping a
 Symbol over their storage.** `name`/`type` resolve their target through
@@ -2373,6 +2564,38 @@ printer chose instead of by a hand-written varnode specifier. `linkSymbol`'s
 `query_container_for_link(addr, usepoint)` then binds it on the second pass, and
 `assertions::carried_usepoint_symbols` carries it across the in-process surface's
 IR rebuild.
+
+`format` and `isolate` are symbol-scoped in the same way: each names
+something only a finished decompile has, and takes effect in the second pass.
+`format` names a constant by the address of the instruction that reads it
+(`decompiler/crates/kuna-console/src/kuna_constformat.rs`). The candidates are
+the integer constants the live operations at that address read, leaving out the
+inputs that are not printed as numbers (a LOAD or STORE space id, a user-op
+index, a branch, call or return target, a SUBPIECE truncation, a PTRSUB offset,
+a PTRADD element size) and a constant whose read-facing type is an enum, which
+prints as the enum's names whatever its format; when only such a constant is
+read the rejection says so. One candidate value needs no more; several need the
+directive's `<value>`, and the rejection lists the values so the caller can
+pick. A `char` request is refused for a constant wider than 32 bits whose
+value is not the sign extension of its low 32 bits, since the character
+literal keeps only those bits. Each chosen constant gets
+the EquateSymbol `force varnode` builds (`Funcdata::build_dynamic_symbol`,
+anchored by the constant's dataflow hash) with the display format set and the
+type locked, and `assertions::carried_dynamic_symbols` carries it to the
+second pass, where the dynamic mapping finds the constant by its hash and the
+printer reads the format. After the second pass `assertions::verify_formats`
+looks for a constant at the address that holds a Symbol of that format; when
+there is none the directive is refused, since the C then prints the constant
+as before. The console spelling is `force constant <addr> <format> [<value>]`,
+and its `decompile` prints `Rejected force constant ...` for the same check.
+
+`isolate` resolves its name as `name` does and sets the Symbol's isolated flag
+(`kuna_hightarget.rs (isolate_local)`); the console's `isolate` command is the
+same function. A printed register local gets the isolated, type-locked Symbol
+over its definition that a `type` stating its present type would map, and the
+use-point carry brings it to the second pass. A stack local and a parameter
+are isolated without a type lock, and reach the second pass by their storage
+(chapter 06, `decompiler/crates/kuna-decomp/src/p6_variables/kuna_isolated.rs`).
 
 When a Varnode is created at an isolated local's mapped definition,
 `Funcdata::set_varnode_properties` applies its exact, locked type before
@@ -2482,6 +2705,17 @@ Definitions sharing one native instruction address use a verified dynamic-hash
 anchor; an unresolved or ambiguous anchor still rejects the directive.
 Type seeding uses the definition usepoint, and naming retains the selected SymbolId;
 a storage-only re-query must not attach another lifetime's name or type.
+
+Console `rename` and whole-variable `retype` edits carried by `PriorNames`
+survive switching to another function and returning within the loaded program.
+`IfaceDecompData`
+records the replay after an explicit edit, keyed by the resolved entry address
+and its address space. An untouched function gets its own fresh analysis. The
+replay uses the existing definition identities and numbering context to find
+the edited local. The active function continues to carry its current edits
+directly across rebuilds. Later edits replace the saved replay for that entry,
+and explicitly loading the already-selected entry clears its replay and starts
+a fresh local analysis. Clearing the architecture clears the session records.
 
 (kuna) **A `prototype` directive binds to `<func>`, whatever name its declaration
 carries.** The operand says which function the signature describes; the
@@ -2774,7 +3008,7 @@ wanted, so silence there is the failure this plane exists to end.
 Durability is caller-carried, as it is for boundaries: `--assert @FILE` is the
 artifact.
 
-A `flow` directive is the sharpest of the four function-scoped ones, and the only
+A `flow` directive is the sharpest of the function-scoped ones, and the only
 one that changes which bytes are in the function at all. P2 classifies the flow
 out of each instruction — branch, call, call-that-does-not-return, return — and
 `FlowInfo::process` consults the per-function `Override` store
@@ -2810,6 +3044,30 @@ the same engine in process, exited 1 on the same command. Every per-function abo
 is now stamped onto the retained `Funcdata` (`set_kuna_pipeline_failure`) so that
 shell names its reason, and the script surface reports the raised abort the way it
 already reported the swallowed one.
+
+A `callee` directive states where one indirect call goes. The engine cannot
+derive the destination of `call *(%rax)`, and it already has the store for it:
+the per-function `Override` keeps an indirect-call redirect, which kuna plants
+itself when it resolves a call and restarts. The directive plants the same
+redirect before flow (`decompiler/crates/kuna-console/src/kuna_calleeoverride.rs
+(plant)`). It first decodes the instruction at the call site and accepts an
+indirect call or an indirect jump; a direct call, any other instruction and a
+destination that is not a function entry are rejected with the reason, and
+nothing is planted. A destination is a function name or a `0x` entry address.
+The fact is parked on the architecture under the entry of the function that
+holds the call, and P2 turns the call into a direct call to the callee, or the
+jump into a tail call (02, *Call sites*). The script surface lowers the
+directive to the console command `override indirect <callsite> <name|address>`
+(`kuna-console/src/ifacedecomp.rs (IfcOverrideIndirect)`), which calls the same
+`plant`. A call site the function's flow does not reach cannot be seen before
+flow, so the engine records it on the `Funcdata` after the follow and both
+surfaces turn that record into a `fatal` rejection, as they do for a refused
+`flow` (`assertions::record_rejected_callee_overrides`, and the console's
+`Rejected override indirect ...` line). The planted redirect is consulted before
+any resolution of kuna's own, so the statement outranks a destination kuna
+would have recovered (the import a GOT-slot call loads). Two `callee`
+directives for one call site leave the later one planted; the same function
+reports the earlier one rejected.
 
 A `call` (or `callreturn`) override carries one more fact with it: the RET-call
 chain it starts. `push <continuation>; push <target>; ret` is a call spelled
@@ -2855,8 +3113,8 @@ flow-call-override-retain.md`): one directive against a 22-link body, which went
 from `LoadLibraryA(s_40151e);` to the whole self-unpacking sequence.
 
 The same bounded walk recognizes a chain reached from the function entry
-without a directive (`kuna_entry_chain_sites`) when the P2
-`entryretdispatch` option is on (default on, DIV-168). Before the shared
+without a directive (`kuna_entry_chain_sites`; the P2 `entryretdispatch`
+recovery, DIV-168, always on). Before the shared
 decompile step follows flow, every recognized link without an explicit caller
 fact is seeded as `call`. Caller-stated flow classifications own their sites;
 in particular, explicit `flow <site> return` vetoes an automatic CALL and is
@@ -2866,15 +3124,13 @@ through the incoming return-address word, a discarded exact-fall-through push,
 an unrelated exact-fall-through store, and a computed return whose source lacks
 the adjacent in-run store pair produce no sites and keep RETURN semantics. The
 console's prefollowed-IR fast path is declined only when
-the enabled entry scan finds a link, because that IR was followed before the
-derived calls were known. `option entryretdispatch off` restores the first-RET
-termination while leaving explicit `flow <site> call` chain propagation
-available. The site and instruction caps, continuation clearing, opaque-flow
+the entry scan finds a link, because that IR was followed before the
+derived calls were known. The site and instruction caps, continuation clearing, opaque-flow
 stops, and multi-link behavior are the same code as the explicit override path
 rather than a second recognizer.
 
-The same provenance has a separate one-store classification under
-`pushimmediateret` (default on, DIV-170). When RETURN pops the sole current-run
+The same provenance has a separate one-store classification, the
+`pushimmediateret` recovery (DIV-170, always on). When RETURN pops the sole current-run
 stack store and that exact store is an immediate, the shared decompile step
 seeds BRANCH rather than CALL, with no fall-through and without registering the
 target as a function. A second same-stack store declines so the adjacent-pair
@@ -2910,7 +3166,7 @@ in `decompiler/crates/kuna-cli/src/loadtime.rs (binding, settings)`:
 `apply_to_command` configures the console subprocess, and `apply_to_process`
 temporarily configures the in-process loader. Repeated options keep their final
 value. An omitted option leaves the inherited environment alone; an explicit
-disabled `macho-arm64e` removes its variable. `LoadtimeEnv` restores inherited
+`macho-arm64e off` exports the off-token the loader reads. `LoadtimeEnv` restores inherited
 values, including non-Unicode values, when the load returns or unwinds. The
 conversions preserve each loader's accepted tokens and fallback behavior;
 runtime option validation remains separate.
@@ -2926,24 +3182,47 @@ runtime `on_or_off` parser.
 
 | env var | option | read at |
 |---|---|---|
-| `KUNA_RELOC_OBJECTS` | `relocobjects` | relocatable-object (`ET_REL` `.o`, COFF `.obj`) layout + relocation resolution in the loader, `decompiler/crates/kuna-analysis/src/loadimage_object.rs (RELOC_OBJECTS_ENV)` |
-| `KUNA_I386_PIE_PLT` | `i386_pie_plt` | i386 PIE PLT-stub decode, `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_i386_pie_plt.rs (I386_PIE_PLT_ENV)` |
-| `KUNA_DYNRELOCS` | `dynrelocs` | linked-image dynamic-relocation application + the `PT_GNU_RELRO` constant slots, `decompiler/crates/kuna-analysis/src/loader/kuna_dynrelocs.rs (resolve)` |
-| `KUNA_RELOCREBASE` | `relocrebase` | relocatable-object analysis-fact rebase, `decompiler/crates/kuna-analysis/src/loader/kuna_relocrebase.rs (rebased_view)` |
 | `KUNA_IFUNCFPRET` | `ifuncfpret` | x86-64 IFUNC (`R_X86_64_IRELATIVE`) stub naming, `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_ifuncfpret.rs (IFUNCFPRET_ENV)` |
-| `KUNA_TYPEDEPTH` | `typedepth` | DWARF full-depth type resolution, `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_typedepth.rs (TYPEDEPTH_ENV)` |
-| `KUNA_DWARFSTRUCTS` | `dwarfstructs` | DWARF aggregate-layout import (`DW_AT_byte_size` + `DW_TAG_member` walk), `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_dwarfstructs.rs (DWARFSTRUCTS_ENV)` |
-| `KUNA_CALLTARGETTYPE` | `calltargettype` | DWARF `DW_TAG_subroutine_type` import as a function prototype (off unless the option, or the `aggressive` preset, is on, and never for Rust output), `decompiler/crates/kuna-decomp/src/p5_types/kuna_calltargettype.rs (CALLTARGETTYPE_ENV)` |
-| `KUNA_DWARFVARIANTS` | `dwarfvariants` | DWARF variant-part (discriminated-union) import (`DW_AT_discr` + `DW_TAG_variant` walk), `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_dwarfvariants.rs (DWARFVARIANTS_ENV)` |
-| `KUNA_PDATACHAINED` | `pdatachained` | PE `.pdata` chained-`UNWIND_INFO` entry suppression, `decompiler/crates/kuna-analysis/src/analyzers/entry/pe_entry.rs (pdata_begins)` |
-| `KUNA_REXTHUNK` | `rexthunk` | x86-64 PE import-thunk decode drops the `FF 25` one byte into a REX-prefixed tail jump, `decompiler/crates/kuna-analysis/src/loader/kuna_rexthunk.rs (is_rex_tail)` |
-| `KUNA_PEORDINAL` | `peordinal` | PE import-by-ordinal naming from built-in `OLEAUT32`/`WS2_32`/`WSOCK32`/`MSVBVM60` export tables, `decompiler/crates/kuna-analysis/src/loader/kuna_peordinal.rs (ordinal_name)` |
+| `KUNA_PPCAPU` | `ppcapu` | PowerPC32 e500 selection from an SPE APU note, `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_ppcapu.rs (PPCAPU_ENV)` |
+| `KUNA_CALLTARGETTYPE` | `calltargettype` | DWARF `DW_TAG_subroutine_type` import as a function prototype (on unless the option is set off, and never for Rust output), `decompiler/crates/kuna-decomp/src/p5_types/kuna_calltargettype.rs (CALLTARGETTYPE_ENV)` |
 | `KUNA_MACHO_SLICE` | `--slice` | Mach-O fat-binary slice peel, `decompiler/crates/kuna-console/src/engine.rs (select_macho_slice)` |
-| `KUNA_MACHO_ARM64E` | `macho-arm64e` | arm64e spec selection, `decompiler/crates/kuna-analysis/src/loader/format/macho.rs (MACHO_ARM64E_ENV)` |
+| `KUNA_MACHO_ARM64E` | `macho-arm64e` | arm64e spec selection (on by default), `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_macho_arm64e.rs (MACHO_ARM64E_ENV)` |
 | `KUNA_ARM_ISA` | `--isa` | explicit ARM/Thumb `TMode` selection over the mapped code ranges, `decompiler/crates/kuna-console/src/engine.rs (ARM_ISA_ENV)` |
 
 The matching `option` is still applied afterwards so the run's configuration
 record is honest.
+
+(kuna) **Explicit load options.** The environment is the CLI's channel, not
+the only one.
+`decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_loadoptions.rs (LoadOptions)`
+holds every load-time setting: the load-time catalog options, the fat slice,
+the `.pdb`, `.fid` and FLIRT paths, the Go release, and the `KUNA_LOAD_OBJC`,
+`KUNA_LOAD_STRINGS` and `KUNA_LOAD_MMAP` switches. A library caller passes it
+through `decompiler/crates/kuna-console/src/kuna_bootstrap.rs (Bootstrap)`.
+Each gate first reads the options in force on its thread (`scoped`) and falls
+back to its environment variable only when no options are in force.
+Precedence is per load and never a merge. A load with explicit options reads
+and writes no load-time environment variable: a field left at its default
+means the shipped default, not the environment's value, and an unset ARM ISA
+leaves the image's own evidence to decide instead of reading `KUNA_ARM_ISA`. A load
+without options puts the environment in force on its thread for the whole
+load, whatever another program has in force there, so the CLI and the
+`bootstrap_*` entry points read exactly the variables they read before. The
+built `Architecture` remembers which kind of load built it. An explicit
+program keeps a copy of its options and re-enters them
+(`Architecture::load_scope`) around its analysis commit, decompiles, name
+lookups, assertions and console commands, so a later load with other options
+on the same thread cannot leak into it. An environment program keeps reading
+the variables live. A load-time `option` line updates both the program's copy
+and the environment variable, so a later `load file` in the session still sees
+it. `calltargettype` is the exception: its line sets only the decompile-time
+switch, so its load-time half, the DWARF function-pointer mapping, follows the
+load's options or `KUNA_CALLTARGETTYPE`, never the console line. Scopes belong
+to one thread and nest: the most recently entered live scope is in force, and
+releasing a scope out of order removes only its own options.
+Kuna enters and leaves its scopes inside each synchronous call; a caller that
+enters one itself must not hold it across an `.await` on a shared executor
+thread.
 
 ## 0.3 The IR substrate
 
@@ -3059,7 +3338,14 @@ the top of the space by halving the remaining gap, so a block renumbered to end
 near the maximum would run out of room again within a few dozen appends, and
 building a block of tens of thousands of operations would renumber it thousands
 of times. With the upper half free, a renumber is followed by roughly 280
-appends before the next one.
+appends before the next one. That alone still renumbers a growing block once
+per 280 operations, which is quadratic work in a long straight-line block: a
+30,000-instruction block took minutes to build. So an append steps by the
+smaller of the fixed gap (`0x1000000`) and the order space divided by the
+block's operation count. Blocks of up to 255 operations step exactly as
+before; a longer block's gap shrinks as it grows, a renumber then leaves room
+for about as many appends as the block already holds, and the renumbers of a
+block grow with the logarithm of its length.
 
 Deleting a varnode through `Funcdata::delete_varnode` first checks the bank's
 deletion precondition: the node must have neither a defining operation nor any
@@ -3149,6 +3435,20 @@ function's banks hold millions of Varnodes and ops at once, retired ops included
 put 10.8 million Varnodes and 4.3 million ops in the arenas in one pass), so these
 are 32 bytes off every Varnode slot (264 to 232) and one allocation off every op.
 
+A Varnode created without a data-type has the unnamed unknown base of its size
+(`Datatype::is_unknown_placeholder`), and it allocates that 168-byte skeleton the
+first time its type is read, not when it is created
+(`decompiler/crates/kuna-decomp/src/substrate/varnode.rs (unknown_skeleton)`).
+Most such Varnodes are retyped before anything reads the skeleton, or are never
+read at all, like the iop annotations of call guards; nonzero-mask propagation,
+which visits every Varnode before type inference, reads an input's type only when
+it is type-locked (`decompiler/crates/kuna-decomp/src/substrate/funcdata_varnode.rs
+(Funcdata::calc_nz_mask)`). Each skeleton still belongs
+to exactly one Varnode: merging and retyping compare types by identity, so
+sharing one skeleton per size would let two unrelated unknown-typed variables
+compare equal and merge. In libpython3.11's `0x3b72c0` the guards' outputs and
+annotations held 1.9 GB of skeletons at the first full heritage pass.
+
 Read-only block queries walk the stored Varnode descendants without copying
 them. Common-subexpression lookup returns the first eligible equal op in that
 sequence; earliest-use lookup instead compares block-local op order. The common
@@ -3237,20 +3537,15 @@ and an agent writes:
   Non-global scope has empty name` and emits nothing. (Answering with the reason
   attached is what DIV-90 gave the subprocess surface, which until then replaced
   it with a fixed string — so this symptom, which `docs/options.md` publishes as
-  the trigger for flipping `symbolnamerepair`, was unmatchable from the surface an
+  the trigger for the repair, was unmatchable from the surface an
   agent is most likely driving.) Symbol-name bytes are attacker-controlled data
   that no header check
   validates, which makes that a denial-of-analysis primitive a hostile binary can
-  buy for a few `.strtab` bytes. `symbolnamerepair` (on|off, default on;
-  `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_symbolnamerepair.rs`) skips
+  buy for a few `.strtab` bytes. The repair
+  (`decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_symbolnamerepair.rs`) skips
   the degenerate component instead, so the symbol keeps the rest of its scope path
   and the load survives; only the empty component is treated as degenerate, since
-  every other string names a Scope perfectly well however strange it looks. Off
-  restores the hard error, which is what someone investigating a binary's symbol
-  table itself wants to see. Like the other gates consumed inside `load file`
-  (`relocrebase`, `i386_pie_plt`, `typedepth`) it is read through a process
-  environment variable rather than an `Architecture` flag, because `option` is
-  applied downstream of the load it would have to govern.
+  every other string names a Scope perfectly well however strange it looks.
   The scope path is not the only thing a name's bytes reach: the same string is
   printed into emitted C, and nothing on the way validates it.
   `symbolnamechars` (off|safe|ident, default safe;
@@ -3272,7 +3567,7 @@ and an agent writes:
   name a roughly 498-fold input-to-RSS amplifier: 600 KB of `.strtab` in a single
   name cost 292 MB, and the whole-binary path is quadratic in depth on top of
   that, so tens of kilobytes already bought a stall of tens of seconds.
-  `symbolnamebound` (`<n>|off`, default 256;
+  The scope bound (256 components, always on;
   `decompiler/crates/kuna-decomp/src/p0_knowledge/kuna_symbolnamebound.rs`) caps
   the scope-component count, and with it each component's length and the whole
   scope path's length. A name over a limit is **folded**, not truncated: the
@@ -3307,15 +3602,13 @@ and an agent writes:
   the ceiling and none of their scopes can be shared. Closing that needs a cap on
   the total `Scope` population, or a cheaper `Scope`; what this gate closes is
   the reported primitive, one name turning 600 KB of `.strtab` into 292 MB, and
-  the quadratic whole-binary blowup that rode on it. Same loader-tier env
-  bridge as `symbolnamerepair`, and deliberately a
-  separate gate from it: turning the repair off is a debugging affordance for
-  someone inspecting a symbol table, and that must not also remove a resource
-  bound.
+  the quadratic whole-binary blowup that rode on it.
 - **The Override store** (`decompiler/crates/kuna-decomp/src/p0_knowledge/overrides.rs
   (Override)`): per-function commands that override pipeline decisions — flow
   reclassification, direct-call redirects, prototype replacement, multistage
-  jump-table requests, dead-code delays, forced gotos. Its defining property is
+  jump-table requests, dead-code delays, forced gotos, and (kuna) per-call-site
+  output type locks (`insert_output_typelock`, applied by the P5
+  `sitetypelock` action — chapter 05). Its defining property is
   that it **survives `Funcdata::clear`**
   (`decompiler/crates/kuna-decomp/src/substrate/funcdata.rs (clear)` resets the
   arenas and analysis state but not the override store): a mid-pipeline pass that
@@ -3374,20 +3667,18 @@ and an agent writes:
   catalog or its count/tier gates). Three concrete presets ship:
   **`reliable`** (the shipped defaults, an empty-override alias),
   **`aggressive`** (every off-by-default recovery/analysis pass on, except
-  `v850indirectbranch`, which would mis-decode register-indirect calls off-V850,
   `dwarf_lines`, which annotates rather than recovers and would bury a `-g`
   binary's body in `/* src.c:NNN */` comments; the exclusion list is enforced by an invariant test in
   `decompiler/crates/kuna-decomp/src/p0_knowledge/modes.rs`, so a default-off
   option is either in the preset or listed there with its reason),
   and **`fast`** (`listing`, `funcstart_patterns`, and `aif` off to avoid
-  program-wide decode and speculative discovery, `ctypes` and `partialaccess`
-  on). A fourth frontend
+  program-wide decode and speculative discovery, `ctypes` on). A fourth frontend
   policy, **`auto`**, resolves from the raw input length before the Architecture
   is built: `<500 KiB` selects `aggressive`, `500 KiB–<2 MiB` selects `reliable`,
   and `>=2 MiB` selects `fast`. `auto` also carries its own override list,
-  applied before the selected preset's: `ctypes=on` and `partialaccess=on`, so
-  the C spelling of the core types and of a partial access (chapter
-  [09](09-emission.md) §9.2) does not change with input size.
+  applied before the selected preset's: `ctypes=on`, so the C spelling of the
+  core types (chapter [09](09-emission.md) §9.2) does not change with input
+  size.
   Size selects how much discovery and recovery a run can afford; spelling costs
   nothing and is not part of that trade. An explicit `--mode reliable` stays the
   catalog defaults. One function,

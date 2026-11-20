@@ -23,6 +23,36 @@ pub(crate) struct CallGraph {
     plt_local: Vec<(u64, u64)>,
 }
 
+/// (kuna `callbacktype`) [`CallGraph::callback_refs`]: what the graph said
+/// about each entry it was asked for. An entry it was not asked for has no
+/// references.
+pub(crate) struct CallbackRefs {
+    by_entry: BTreeMap<u64, EntryRefs>,
+}
+
+struct EntryRefs {
+    taken: Vec<(u64, Option<u64>)>,
+    called: bool,
+    callers: Option<Vec<u64>>,
+}
+
+impl CallbackRefs {
+    /// [`CallGraph::address_taken_refs`] for `entry`.
+    pub(crate) fn address_taken_refs(&self, entry: u64) -> Vec<(u64, Option<u64>)> {
+        self.by_entry.get(&entry).map_or_else(Vec::new, |r| r.taken.clone())
+    }
+
+    /// [`CallGraph::called_directly`] for `entry`.
+    pub(crate) fn called_directly(&self, entry: u64) -> bool {
+        self.by_entry.get(&entry).is_some_and(|r| r.called)
+    }
+
+    /// [`CallGraph::direct_callers`] for `entry`.
+    pub(crate) fn direct_callers(&self, entry: u64) -> Option<Vec<u64>> {
+        self.by_entry.get(&entry).map_or(Some(Vec::new()), |r| r.callers.clone())
+    }
+}
+
 impl CallGraph {
     pub(crate) fn build(
         prog: &ConsoleProgram,
@@ -78,11 +108,7 @@ impl CallGraph {
             }
         }
         entries.sort_unstable();
-        let plt_local = if prog.arch().plt_local_calls {
-            prog.arch().plt_local.to_vec()
-        } else {
-            Vec::new()
-        };
+        let plt_local = prog.arch().plt_local.to_vec();
         CallGraph { index, entries, plt_local }
     }
 
@@ -125,6 +151,25 @@ impl CallGraph {
             .filter(|r| matches!(r.kind, XrefKind::Data | XrefKind::Read | XrefKind::Write))
             .map(|r| (r.from, self.owner_of(r.from)))
             .collect()
+    }
+
+    /// (kuna `callbacktype`) The answers [`Self::address_taken_refs`],
+    /// [`Self::called_directly`] and [`Self::direct_callers`] give for each of
+    /// `entries`, kept so a run can let the reference index go long before it
+    /// asks them.
+    pub(crate) fn callback_refs(&self, entries: impl IntoIterator<Item = u64>) -> CallbackRefs {
+        let by_entry = entries
+            .into_iter()
+            .map(|entry| {
+                let refs = EntryRefs {
+                    taken: self.address_taken_refs(entry),
+                    called: self.called_directly(entry),
+                    callers: self.direct_callers(entry),
+                };
+                (entry, refs)
+            })
+            .collect();
+        CallbackRefs { by_entry }
     }
 
     /// (kuna `calleevote`) Every direct call and tail jump to the function
@@ -267,6 +312,37 @@ impl CallGraph {
         let at = self.entries.partition_point(|(addr, _)| *addr <= vma);
         let (addr, size) = *self.entries.get(at.checked_sub(1)?)?;
         (vma == addr || vma - addr < size).then_some(addr)
+    }
+
+    /// Every inventory function as `(entry, extent)`, ascending by entry.
+    pub(crate) fn entry_extents(&self) -> &[(u64, u64)] {
+        &self.entries
+    }
+
+    /// (kuna `calleereginputs custom`) The direct call sites of `entry` from
+    /// other functions, as `(call instruction, owning entry)`, or `None` when
+    /// its caller set is not a list of direct calls: its address is taken in
+    /// code (a Data/Read/Write reference), another function branches to it, or
+    /// a call to it comes from no known function. Unlike
+    /// [`Self::direct_call_sites`] this does not consult the `open` set, which is
+    /// only populated on x86-64; the caller supplies the data-stored
+    /// address-taken check for 32-bit images separately.
+    pub(crate) fn reg_call_sites(&self, entry: u64) -> Option<Vec<(u64, u64)>> {
+        let mut out = Vec::new();
+        for r in self.index.refs_to(entry) {
+            let owner = match r.kind {
+                XrefKind::Call | XrefKind::Jump => self.owner_of(r.from)?,
+                XrefKind::Data | XrefKind::Read | XrefKind::Write => return None,
+            };
+            if owner == entry {
+                continue;
+            }
+            if r.kind == XrefKind::Jump {
+                return None;
+            }
+            out.push((r.from, owner));
+        }
+        Some(out)
     }
 
     /// Is `vma` an inventory entry?
@@ -573,6 +649,7 @@ mod tests {
                 ("listing", "on"),
                 ("funcstart_patterns", "on"),
                 ("aif", "off"),
+                ("tailcallentry", "off"),
             ] {
                 prog.arch_mut().set_kuna_option(name, value).unwrap();
             }
@@ -632,6 +709,7 @@ mod tests {
                 ("funcstart_patterns", "on"),
                 ("armframes", "on"),
                 ("aif", "off"),
+                ("tailcallentry", "off"),
             ] {
                 prog.arch_mut().set_kuna_option(name, value).unwrap();
             }

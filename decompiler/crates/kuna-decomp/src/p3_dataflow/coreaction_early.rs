@@ -280,7 +280,9 @@ impl Action for ActionConstbase {
         let bb = data.bblocks_get_block(0);
         let bb_start = data.bblocks_block_start(bb);
 
-        if let Err(error) = crate::kuna_callmechanisms::apply_entry(data) {
+        if let Err(error) = crate::kuna_callmechanisms::apply_entry(data)
+            .and_then(|_| crate::p4_calls::kuna_registerslots::apply(data))
+        {
             data.kuna_call_mechanisms.failure = Some(error.to_string());
             return 0;
         }
@@ -395,6 +397,9 @@ impl Action for ActionHeritage {
         if data.get_arch().pass_through {
             crate::kuna_entryreads::capture(data);
         }
+        // (kuna) Expand a frame `rep movs` with a known count before the stack's
+        // first heritage (`kuna_repframecopy.rs`).
+        crate::p3_dataflow::kuna_repframecopy::expand_all(data);
         // (kuna) Repair any synthetic lowered-switch BRANCHIND whose input
         // heritage normalized away (see `kuna_repair_lowered_switch_inputs`).
         // A no-op unless a lowered-switch was installed this function, so it

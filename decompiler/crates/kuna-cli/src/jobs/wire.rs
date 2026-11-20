@@ -14,7 +14,7 @@ use kuna_decomp::kuna_structsynth::shard::FunctionRecord;
 use super::TargetSpec;
 
 const SPEC_MAGIC: &[u8; 12] = b"KUNAJOBSPEC3";
-pub(super) const RESULT_MAGIC: &[u8; 12] = b"KUNAJOBRES11";
+pub(super) const RESULT_MAGIC: &[u8; 12] = b"KUNAJOBRES12";
 
 /// Result-stream frame kinds.  The envelope is what lets a truncated tail be
 /// dropped rather than guessed.
@@ -261,125 +261,7 @@ impl ResultWriter {
     }
 
     pub(crate) fn push(&mut self, r: &FuncResult) -> Result<(), String> {
-        let mut body = Vec::with_capacity(256);
-        put_u64(&mut body, r.address);
-        put_u64(&mut body, r.byte_address);
-        body.extend_from_slice(&r.size.to_le_bytes());
-        put_str(&mut body, &r.name);
-        put_opt_str(&mut body, r.code.as_deref());
-        put_opt_str(&mut body, r.error.as_deref());
-        put_opt_str(&mut body, r.proto.as_deref());
-        put_opt_str(&mut body, r.emitted_c_name.as_deref());
-        put_object_location(&mut body, r.object_location.as_ref());
-        put_u32(&mut body, r.aliases.len() as u32);
-        for a in &r.aliases {
-            put_str(&mut body, a);
-        }
-        put_u32(&mut body, r.line_mappings.len() as u32);
-        for m in &r.line_mappings {
-            put_u64(&mut body, m.line_number as u64);
-            put_u64s(&mut body, &m.addresses);
-        }
-        put_u32(&mut body, r.variables.len() as u32);
-        for v in &r.variables {
-            put_str(&mut body, &v.name);
-            put_str(&mut body, &v.type_name);
-            body.push(u8::from(v.is_param) | (u8::from(v.split_piece) << 1));
-            match v.arg_index {
-                Some(i) => {
-                    body.push(1);
-                    put_u64(&mut body, i as u64);
-                }
-                None => body.push(0),
-            }
-            match v.stack_offset {
-                Some(o) => {
-                    body.push(1);
-                    body.extend_from_slice(&o.to_le_bytes());
-                }
-                None => body.push(0),
-            }
-            body.extend_from_slice(&v.size.to_le_bytes());
-            put_u32(&mut body, v.line_numbers.len() as u32);
-            for &n in &v.line_numbers {
-                put_u64(&mut body, n as u64);
-            }
-            put_u64s(&mut body, &v.addresses);
-        }
-        // (kuna `structdefs`) The recovered type definitions travel with the
-        // record: a pooled worker renders the C, so the parent has no `Funcdata`
-        // left to re-derive them from.
-        put_u32(&mut body, r.types.len() as u32);
-        for t in &r.types {
-            put_str(&mut body, &t.name);
-            put_str(&mut body, &t.definition);
-            body.extend_from_slice(&t.size.to_le_bytes());
-        }
-        put_u32(&mut body, r.stack_objects.len() as u32);
-        for object in &r.stack_objects {
-            put_str(&mut body, &object.id);
-            put_str(&mut body, &object.name);
-            body.extend_from_slice(&object.stack_offset.to_le_bytes());
-            body.extend_from_slice(&object.size.to_le_bytes());
-            body.push(u8::from(object.defined));
-            put_u32(&mut body, object.uses.len() as u32);
-            for use_ in &object.uses {
-                put_u64(&mut body, use_.address);
-                body.extend_from_slice(&use_.slot.to_le_bytes());
-                put_str(&mut body, &use_.type_name);
-            }
-        }
-        // (kuna `globalref`) The globals the body names by address, for the
-        // project header the parent writes.
-        put_u32(&mut body, r.globals.len() as u32);
-        for g in &r.globals {
-            put_u64(&mut body, g.address);
-            put_str(&mut body, &g.name);
-            put_str(&mut body, &g.declaration);
-            body.extend_from_slice(&g.size.to_le_bytes());
-            body.push(
-                u8::from(g.unknown)
-                    | u8::from(g.direct) << 1
-                    | u8::from(g.aggregate) << 2
-                    | u8::from(g.elem) << 3
-                    | u8::from(g.integer) << 4,
-            );
-        }
-        // (kuna `calltargettype`) The calls through synthesized fields, for the
-        // project header the parent writes.
-        put_u32(&mut body, r.field_calls.len() as u32);
-        for f in &r.field_calls {
-            put_str(&mut body, &f.record);
-            put_str(&mut body, &f.field);
-            match &f.declaration {
-                Some(d) => {
-                    body.push(1);
-                    put_str(&mut body, d);
-                }
-                None => body.push(0),
-            }
-        }
-        put_u64s(&mut body, &r.callee_hints);
-        match &r.synth {
-            Some(record) => {
-                body.push(1);
-                record.encode(&mut body);
-            }
-            None => body.push(0),
-        }
-        put_pointerargs(&mut body, r.pointerargs.as_ref());
-        put_u32(&mut body, r.call_declarations.len() as u32);
-        for declaration in &r.call_declarations { put_str(&mut body, declaration); }
-        put_u32(&mut body, r.callwide_prototypes.len() as u32);
-        for contract in &r.callwide_prototypes {
-            put_str(&mut body, &contract.name);
-            put_u64(&mut body, contract.entry);
-            body.push(u8::from(contract.signed));
-            put_u32(&mut body, contract.inputs.len() as u32);
-            for signed in &contract.inputs { body.push(u8::from(*signed)); }
-            body.push(u8::from(contract.definition));
-        }
-        self.frame(FRAME_RESULT, &body)
+        self.frame(FRAME_RESULT, &encode_result(r))
     }
 
     /// Say which function of the chunk this worker starts on ([`FRAME_BEGIN`]).
@@ -395,6 +277,131 @@ impl ResultWriter {
         self.out.write_all(&frame).map_err(|e| format!("worker result write failed: {e}"))?;
         self.out.flush().map_err(|e| format!("worker result flush failed: {e}"))
     }
+}
+
+/// One result's record body, as a result frame carries it; [`decode_result`]
+/// reads it back.
+pub(crate) fn encode_result(r: &FuncResult) -> Vec<u8> {
+    let mut body = Vec::with_capacity(256);
+    put_u64(&mut body, r.address);
+    put_u64(&mut body, r.byte_address);
+    body.extend_from_slice(&r.size.to_le_bytes());
+    put_str(&mut body, &r.name);
+    put_opt_str(&mut body, r.code.as_deref());
+    put_opt_str(&mut body, r.error.as_deref());
+    put_opt_str(&mut body, r.proto.as_deref());
+    put_opt_str(&mut body, r.emitted_c_name.as_deref());
+    put_object_location(&mut body, r.object_location.as_ref());
+    put_u32(&mut body, r.aliases.len() as u32);
+    for a in &r.aliases {
+        put_str(&mut body, a);
+    }
+    put_u32(&mut body, r.line_mappings.len() as u32);
+    for m in &r.line_mappings {
+        put_u64(&mut body, m.line_number as u64);
+        put_u64s(&mut body, &m.addresses);
+    }
+    put_u32(&mut body, r.variables.len() as u32);
+    for v in &r.variables {
+        put_str(&mut body, &v.name);
+        put_str(&mut body, &v.type_name);
+        body.push(u8::from(v.is_param) | (u8::from(v.split_piece) << 1));
+        match v.arg_index {
+            Some(i) => {
+                body.push(1);
+                put_u64(&mut body, i as u64);
+            }
+            None => body.push(0),
+        }
+        match v.stack_offset {
+            Some(o) => {
+                body.push(1);
+                body.extend_from_slice(&o.to_le_bytes());
+            }
+            None => body.push(0),
+        }
+        body.extend_from_slice(&v.size.to_le_bytes());
+        put_u32(&mut body, v.line_numbers.len() as u32);
+        for &n in &v.line_numbers {
+            put_u64(&mut body, n as u64);
+        }
+        put_u64s(&mut body, &v.addresses);
+    }
+    // (kuna `structdefs`) The recovered type definitions travel with the
+    // record: a pooled worker renders the C, so the parent has no `Funcdata`
+    // left to re-derive them from.
+    put_u32(&mut body, r.types.len() as u32);
+    for t in &r.types {
+        put_str(&mut body, &t.name);
+        put_str(&mut body, &t.definition);
+        body.extend_from_slice(&t.size.to_le_bytes());
+    }
+    put_u32(&mut body, r.stack_objects.len() as u32);
+    for object in &r.stack_objects {
+        put_str(&mut body, &object.id);
+        put_str(&mut body, &object.name);
+        body.extend_from_slice(&object.stack_offset.to_le_bytes());
+        body.extend_from_slice(&object.size.to_le_bytes());
+        body.push(u8::from(object.defined));
+        put_u32(&mut body, object.uses.len() as u32);
+        for use_ in &object.uses {
+            put_u64(&mut body, use_.address);
+            body.extend_from_slice(&use_.slot.to_le_bytes());
+            put_str(&mut body, &use_.type_name);
+        }
+    }
+    // (kuna `globalref`) The globals the body names by address, for the
+    // project header the parent writes.
+    put_u32(&mut body, r.globals.len() as u32);
+    for g in &r.globals {
+        put_u64(&mut body, g.address);
+        put_str(&mut body, &g.name);
+        put_str(&mut body, &g.declaration);
+        body.extend_from_slice(&g.size.to_le_bytes());
+        body.push(
+            u8::from(g.unknown)
+                | u8::from(g.direct) << 1
+                | u8::from(g.aggregate) << 2
+                | u8::from(g.elem) << 3
+                | u8::from(g.integer) << 4,
+        );
+    }
+    // (kuna `calltargettype`) The calls through synthesized fields, for the
+    // project header the parent writes.
+    put_u32(&mut body, r.field_calls.len() as u32);
+    for f in &r.field_calls {
+        put_str(&mut body, &f.record);
+        put_str(&mut body, &f.field);
+        match &f.declaration {
+            Some(d) => {
+                body.push(1);
+                put_str(&mut body, d);
+            }
+            None => body.push(0),
+        }
+    }
+    put_u64s(&mut body, &r.callee_hints);
+    match &r.synth {
+        Some(record) => {
+            body.push(1);
+            record.encode(&mut body);
+        }
+        None => body.push(0),
+    }
+    put_pointerargs(&mut body, r.pointerargs.as_ref());
+    put_warnings(&mut body, &r.warnings);
+    put_u32(&mut body, r.call_declarations.len() as u32);
+    for declaration in &r.call_declarations { put_str(&mut body, declaration); }
+    put_u32(&mut body, r.callwide_prototypes.len() as u32);
+    for contract in &r.callwide_prototypes {
+        put_str(&mut body, &contract.name);
+        put_u64(&mut body, contract.entry);
+        body.push(u8::from(contract.signed));
+        put_u32(&mut body, contract.inputs.len() as u32);
+        for signed in &contract.inputs { body.push(u8::from(*signed)); }
+        body.push(u8::from(contract.definition));
+    }
+    body
 }
 
 /// A worker result file: every complete record, and the chunk position the
@@ -416,7 +423,7 @@ pub(super) fn decode_results(bytes: &[u8]) -> Option<Frames> {
         let Some(len) = r.u32() else { break };
         let Some(body) = r.take(len as usize) else { break };
         match kind {
-            FRAME_RESULT => match decode_one(body) {
+            FRAME_RESULT => match decode_result(body) {
                 Some(rec) => out.results.push(rec),
                 None => break,
             },
@@ -430,7 +437,9 @@ pub(super) fn decode_results(bytes: &[u8]) -> Option<Frames> {
     Some(out)
 }
 
-fn decode_one(body: &[u8]) -> Option<FuncResult> {
+/// Read one record body written by [`encode_result`]; `None` when it is not a
+/// complete one.
+pub(crate) fn decode_result(body: &[u8]) -> Option<FuncResult> {
     let mut r = Reader { bytes: body, pos: 0 };
     let address = r.u64()?;
     let byte_address = r.u64()?;
@@ -566,6 +575,7 @@ fn decode_one(body: &[u8]) -> Option<FuncResult> {
         _ => return None,
     };
     let pointerargs = read_pointerargs(&mut r)?;
+    let warnings = read_warnings(&mut r)?;
     let count = r.u32()? as usize;
     let mut call_declarations = r.sized(count);
     for _ in 0..count { call_declarations.push(r.string()?); }
@@ -610,6 +620,7 @@ fn decode_one(body: &[u8]) -> Option<FuncResult> {
         callee_hints,
         synth,
         pointerargs,
+        warnings,
         detail: None,
     })
 }
@@ -649,6 +660,33 @@ fn put_pointerargs(out: &mut Vec<u8>, record: Option<&kuna_decomp::kuna_pointera
         put_u64(out, call.position.column as u64);
         put_str(out, &call.expression);
     }
+}
+
+fn put_warnings(out: &mut Vec<u8>, warnings: &[kuna_decomp::kuna_functionwarnings::Warning]) {
+    put_u32(out, warnings.len() as u32);
+    for warning in warnings {
+        match warning.address {
+            Some(address) => {
+                out.push(1);
+                put_u64(out, address);
+            }
+            None => out.push(0),
+        }
+        put_str(out, &warning.text);
+        put_u64(out, warning.line as u64);
+    }
+}
+
+fn read_warnings(r: &mut Reader<'_>) -> Option<Vec<kuna_decomp::kuna_functionwarnings::Warning>> {
+    let n = r.u32()? as usize;
+    let mut warnings = r.sized(n);
+    for _ in 0..n {
+        let address = match r.u8()? { 0 => None, 1 => Some(r.u64()?), _ => return None };
+        let text = r.string()?;
+        let line = r.u64()?.try_into().ok()?;
+        warnings.push(kuna_decomp::kuna_functionwarnings::Warning { address, text, line });
+    }
+    Some(warnings)
 }
 
 fn read_entry(r: &mut Reader<'_>) -> Option<kuna_decomp::kuna_pointerargs::Entry> {

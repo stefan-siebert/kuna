@@ -67,14 +67,17 @@ pub fn run(argv: &[String]) -> i32 {
     }
 }
 
-/// Load and resolve the target as `disassemble` does, then run `walk` over it:
-/// in Thumb mode at the even address when the operand is an odd ARM32 pointer.
+/// Load and resolve the target as `disassemble` does, with the decode context
+/// the decompiler lifts under (the MIPS unaligned pairs), then run
+/// `walk` over it: in Thumb mode at the even address when the operand is an
+/// odd ARM32 pointer.
 fn with_target<R>(
     args: &DisArgs,
     bounded: bool,
     walk: impl FnOnce(&ConsoleProgram, &DisArgs, Region) -> Result<R, String>,
 ) -> Result<R, String> {
-    let (prog, region) = load_target(args, ViewRequest::Code, bounded)?;
+    let (mut prog, region) = load_target(args, ViewRequest::Code, bounded)?;
+    kuna_decomp::kuna_mipsunaligned::paint(prog.arch_mut());
     let Some(vma) = thumb_pointer(&prog, args)? else {
         return walk(&prog, args, region);
     };
@@ -319,7 +322,8 @@ fn render(args: &DisArgs) -> Result<Output, String> {
                         ("message".into(), Json::Str(message.clone())),
                     ])
                 });
-                let mut doc = envelope(args, &region, addr, listed, truncated, &notes, "pcode");
+                let doc_notes = crate::funcdecl::json_notes(prog, &notes);
+                let mut doc = envelope(args, &region, addr, listed, truncated, &doc_notes, "pcode");
                 doc.push(("stop_reason".into(), Json::Str(stop_reason.into())));
                 doc.push(("error".into(), error));
                 object_with_rows(doc, "instructions", &rows) + "\n"

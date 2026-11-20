@@ -70,6 +70,8 @@ use kuna_decomp::inject_sleigh::SleighPayload;
 
 use crate::pass::{AnalysisCtx, AnalysisOutput, AnalysisPass, Phase};
 
+pub mod kuna_msvcftolsig;
+
 /// Prefix Ghidra strips from a conflicting library-imported function name before
 /// the target-map probe (`CallFixupAnalyzer.java:207-209`,
 /// `LIBRARY_ID_CONFLICT_PREFIX`).
@@ -102,15 +104,6 @@ pub fn target_fixup_map(arch: &Architecture) -> Vec<(String, String)> {
         let Ok(fixup_name) = std::str::from_utf8(&cf.payload.core.name) else {
             continue;
         };
-        // (kuna `msvcftol`) The kuna-owned MSVC `__ftol`-family fixup is
-        // registered unconditionally at bootstrap (`load file` precedes the
-        // console's `option` lines, so the flag is not readable there). Its
-        // user-visible gate is here, on the install: dropping its targets from
-        // the map leaves the payload registered but never tagged onto a function,
-        // which restores the un-fixed `__ftol()` rendering.
-        if fixup_name == kuna_decomp::kuna_msvcftol::FIXUP_NAME && !arch.msvc_ftol {
-            continue;
-        }
         for target in &cf.target_symbol_names {
             if let Ok(target) = std::str::from_utf8(target) {
                 map.push((target.to_string(), fixup_name.to_string()));
@@ -166,9 +159,13 @@ fn scan_call_fixups(file: &object::File, arch: &Architecture) -> AnalysisOutput 
     // The same FUNC streams the loader installs as FunctionSymbols (a `-pg`
     // `mcount` may be a `.symtab` FUNC, a weak symbol, or a `.dynsym` import);
     // both streams are scanned, with version suffixes stripped (`mcount@GLIBC…`),
-    // exactly as `noreturn.rs` does.
+    // exactly as `noreturn.rs` does. A relocatable object's undefined symbols
+    // carry no type (a kernel module's `__fentry__` and `__x86_return_thunk` are
+    // `NOTYPE UND`); the loader binds each one a call reaches as an extern
+    // function, so those are scanned too.
     for sym in file.symbols().chain(file.dynamic_symbols()) {
-        if sym.kind() != SymbolKind::Text {
+        let untyped_extern = sym.is_undefined() && sym.kind() == SymbolKind::Unknown;
+        if sym.kind() != SymbolKind::Text && !untyped_extern {
             continue;
         }
         let Ok(n) = sym.name() else { continue };
@@ -186,8 +183,7 @@ fn scan_call_fixups(file: &object::File, arch: &Architecture) -> AnalysisOutput 
 /// Port of `CallFixupAnalyzer` (the install half): tag every program function
 /// whose name matches a cspec call-fixup `<target>` so the engine applies that
 /// fixup at flow time. Ghidra ships it default-on (`setDefaultEnablement(true)`,
-/// CallFixupAnalyzer.java:51), so on-by-default is faithful; gate id `"callfixup"`
-/// lets `--option callfixup off` restore the un-fixed rendering.
+/// CallFixupAnalyzer.java:51), so it is always on.
 #[derive(Clone, Copy, Default)]
 pub struct CallFixupPass;
 
@@ -201,7 +197,9 @@ impl AnalysisPass for CallFixupPass {
     }
 
     fn run(&self, ctx: &AnalysisCtx) -> AnalysisOutput {
-        scan_call_fixups(ctx.file, ctx.arch)
+        let mut out = scan_call_fixups(ctx.file, ctx.arch);
+        kuna_msvcftolsig::scan(ctx.file, &mut out);
+        out
     }
 }
 

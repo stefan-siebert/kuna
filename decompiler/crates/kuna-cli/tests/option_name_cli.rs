@@ -25,6 +25,7 @@ const SURFACES: &[&[&str]] = &[
     &["xrefs", "/nonexistent/kuna-binary", "--to", "0x0"],
     &["strings", "/nonexistent/kuna-binary"],
     &["crypto", "/nonexistent/kuna-binary"],
+    &["blobs", "/nonexistent/kuna-binary"],
 ];
 
 fn run(argv: &[String]) -> Output {
@@ -90,7 +91,7 @@ fn a_near_miss_suggests_the_catalogued_spelling() {
 #[test]
 fn a_catalogued_name_still_gets_past_the_parser() {
     for surface in SURFACES {
-        for name in ["loweredswitch", "listing", "readonly", "setlanguage", "relocobjects"] {
+        for name in ["loweredswitch", "listing", "readonly", "setlanguage", "goabi"] {
             let out = run(&with_option(surface, name));
             let err = stderr_of(&out);
             assert!(

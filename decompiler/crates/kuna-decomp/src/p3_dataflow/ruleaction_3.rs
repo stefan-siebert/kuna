@@ -645,6 +645,9 @@ impl Rule for RuleIndirectCollapse {
                 }
                 let output = data.vbank().get(op_out(data, op).expect("indirect output"))
                     .expect("live indirect output");
+                if crate::kuna_octeoneffects::keeps_unaliased_guard(data, indop, output.get_addr(), output.get_size()) {
+                    return 0;
+                }
                 if data.get_call_specs_index(indop).is_some_and(|index| {
                     crate::kuna_calleeprotostack::declared_pointer_reaches(
                         data, data.get_call_specs(index), output.get_addr(), output.get_size(),
@@ -670,6 +673,17 @@ impl Rule for RuleIndirectCollapse {
 
         let out = op_out(data, op).expect("RuleIndirectCollapse: op out");
         let in0 = op_in(data, op, 0).expect("RuleIndirectCollapse: op in0");
+        if data.obank().get(op).is_some_and(|o| o.get_addlflags() & crate::op::pcodeop_addlflags::kuna_persist_stale != 0) {
+            crate::p3_dataflow::kuna_persistcalls::restart_full(data);
+        } else if data.obank().get(op).is_some_and(|o| o.get_addlflags() & crate::op::pcodeop_addlflags::kuna_persist_guard != 0) {
+            let (addr, size) = {
+                let v = data.vbank().get(out).expect("RuleIndirectCollapse: stale op out");
+                (v.get_addr().clone(), v.get_size())
+            };
+            if !crate::p3_dataflow::kuna_persistcalls::guarded(data, op, &addr, size) {
+                crate::p3_dataflow::kuna_persistcalls::restart_full(data);
+            }
+        }
         data.total_replace(out, in0).expect("RuleIndirectCollapse: totalReplace");
         data.op_destroy(op); // Get rid of the INDIRECT
         1
@@ -715,6 +729,9 @@ fn op_from_iop_const(data: &Funcdata, vn: VarnodeId) -> Option<OpId> {
 pub struct RuleMultiCollapse {
     witness: FxHashMap<OpId, SmallVec<[(OpId, int4); 4]>>,
 }
+
+/// How many witnesses' room [`RuleMultiCollapse`] keeps across a reset.
+const WITNESSES_KEPT: usize = 1024;
 
 /// How [`RuleMultiCollapse`]'s walk treats one branch `vn` when its defining
 /// branch is `def`: skipped (seen), matching, expanded (the `MULTIEQUAL`
@@ -792,8 +809,12 @@ impl Rule for RuleMultiCollapse {
         Some(Box::new(RuleMultiCollapse::default()))
     }
 
+    /// A function's witnesses mean nothing to the next one, and the rule lives
+    /// as long as the program: the table is cut back to [`WITNESSES_KEPT`] so
+    /// the largest function's does not stay allocated for the rest of a batch.
     fn reset(&mut self, _data: &mut Funcdata) {
         self.witness.clear();
+        self.witness.shrink_to(WITNESSES_KEPT);
     }
 
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
@@ -1901,6 +1922,10 @@ impl Rule for RulePropagateCopy {
         Some(Box::new(RulePropagateCopy))
     }
 
+    fn replaces_inputs_only(&self) -> bool {
+        true
+    }
+
     fn apply_op(&mut self, op: OpId, data: &mut Funcdata) -> int4 {
         let (return_copy, machine_read) = {
             let operation = data.obank().get(op).expect("RulePropagateCopy: stale op");
@@ -1935,6 +1960,9 @@ impl Rule for RulePropagateCopy {
                                 .is_some_and(|entry| entry.is_isolated)
                     })
             }) {
+                continue;
+            }
+            if crate::kuna_stablenames::is_retyped_definition(data, vn) {
                 continue;
             }
             // (kuna) a store of a value used as an address into a global keeps
@@ -2000,7 +2028,7 @@ impl Rule for RulePropagateCopy {
                         continue; // We must not allow merging of different addrtieds
                     }
                 }
-                // (kuna) `option tiedstorekeep on` widens the addrforce refusal
+                // (kuna) The address-tied store brake widens the addrforce refusal
                 // just above: decline when this marker is the LAST reader of an
                 // address-tied COPY output, which would otherwise strand the frame
                 // store for dead-code elimination.  See
@@ -2008,7 +2036,7 @@ impl Rule for RulePropagateCopy {
                 if crate::p3_dataflow::kuna_tiedstorekeep::declines(data, op, vn, invn) {
                     continue;
                 }
-                // (kuna) `option loopcounterstore on` refuses the same
+                // (kuna) The loop-counter store brake refuses the same
                 // propagation for a self-updating address-tied phi, which is how
                 // a frame-slot loop counter's write-back is deleted.  See
                 // [`crate::p3_dataflow::kuna_loopcounterstore`].
@@ -2033,6 +2061,7 @@ impl Rule for RulePropagateCopy {
             }
             crate::p3_dataflow::kuna_stackreadscope::record_propagated_read(data, copyop, invn);
             data.kuna_inherit_storage(invn, vn);
+            data.note_wave_input_change(op, vn, invn);
             data.op_set_input(op, invn, i).expect("RulePropagateCopy: opSetInput"); // propagate just a single copy
             return 1;
         }
@@ -2487,14 +2516,8 @@ mod tests {
     }
 
     fn build_fd() -> Fd {
-        build_fd_with_global_fields(false)
-    }
-
-    fn build_fd_with_global_fields(enabled: bool) -> Fd {
         let manage = build_manager();
-        let mut glb = ArchContext::new(manage);
-        glb.global_field_store = enabled;
-        let glb = Rc::new(glb);
+        let glb = Rc::new(ArchContext::new(manage));
         let ram = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
         let addr = Address::new(ram, 0x1000);
         let mut fd = Funcdata::new("func", "func", glb, addr, 0x10000000, 0x40).unwrap();
@@ -3306,7 +3329,7 @@ mod tests {
             (true, type_metatype::TYPE_STRUCT, true, 1),
             (true, type_metatype::TYPE_PARTIALSTRUCT, false, 1),
         ] {
-            let mut fd = build_fd_with_global_fields(true);
+            let mut fd = build_fd();
             let input = make_input(&mut fd, 0x100, 8);
             let (_, stored) = def_op(&mut fd, OpCode::CPUI_COPY, &[input], 8);
             let v = fd.vbank_mut().get_mut(stored).unwrap();
@@ -3327,22 +3350,6 @@ mod tests {
     }
 
     #[test]
-    fn propagate_copy_releases_aggregate_store_when_option_is_off() {
-        use crate::dtype::{type_metatype, Datatype};
-        use crate::varnode::varnode_flags;
-        let mut fd = build_fd_with_global_fields(false);
-        let input = make_input(&mut fd, 0x100, 8);
-        let (_, stored) = def_op(&mut fd, OpCode::CPUI_COPY, &[input], 8);
-        let v = fd.vbank_mut().get_mut(stored).unwrap();
-        v.set_flags_pub(varnode_flags::persist);
-        v.update_type_locked(Rc::new(Datatype::new(8, type_metatype::TYPE_ARRAY)), true, true);
-        let iop = fd.new_constant(8, 0);
-        let (marker, _) = def_op(&mut fd, OpCode::CPUI_INDIRECT, &[stored, iop], 8);
-        assert_eq!(RulePropagateCopy.apply_op(marker, &mut fd), 1);
-        assert_eq!(op_in(&fd, marker, 0), Some(input));
-    }
-
-    #[test]
     fn aggregate_load_store_needs_global_alias_ordering() {
         use crate::dtype::{type_metatype, Datatype};
         use crate::varnode::varnode_flags;
@@ -3352,7 +3359,6 @@ mod tests {
             (crate::kuna_indexaliasguard::LEVEL_GLOBAL, true)] {
             let manage = build_manager();
             let mut glb = ArchContext::new(manage);
-            glb.global_field_store = true;
             glb.index_alias_guard = level;
             let glb = Rc::new(glb);
             let memory = Rc::clone(glb.manage().get_space_by_name("ram").unwrap());
