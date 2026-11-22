@@ -18,6 +18,7 @@ use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::kuna_kernelcache::KernelcacheChoice;
 use crate::kuna_kernelcacheboot::KernelcacheBoot;
@@ -41,6 +42,26 @@ pub const LOAD_OBJC_ENV: &str = "KUNA_LOAD_OBJC";
 pub const LOAD_STRINGS_ENV: &str = "KUNA_LOAD_STRINGS";
 /// `off` copies a thin Mach-O into memory instead of mapping it.
 pub const LOAD_MMAP_ENV: &str = "KUNA_LOAD_MMAP";
+
+/// (kuna `pdb` from bytes) The content of a `.pdb` a host read for the image,
+/// for a caller that may open no file itself (a confined viewer handed the
+/// image as bytes). Compared by content; printed by length only.
+#[derive(Clone)]
+pub struct PdbBytes(pub Arc<[u8]>);
+
+impl PartialEq for PdbBytes {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || self.0 == other.0
+    }
+}
+
+impl Eq for PdbBytes {}
+
+impl std::fmt::Debug for PdbBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PdbBytes({} bytes)", self.0.len())
+    }
+}
 
 /// Every load-time setting, one field per option. [`Default`] is the shipped
 /// default of each option, the value an unset environment variable means.
@@ -80,6 +101,9 @@ pub struct LoadOptions {
     pub macho_slice: Option<String>,
     /// An external `.pdb` file to apply.
     pub pdb_path: Option<PathBuf>,
+    /// (kuna `pdb` from bytes) A `.pdb` to apply, already read — tried before
+    /// any path, under the same GUID/age gate. Never from the environment.
+    pub pdb_bytes: Option<PdbBytes>,
     /// An external `.fid` function-ID database to apply.
     pub fid_db: Option<PathBuf>,
     /// FLIRT `.sig` files, or directories whose `*.sig` files are all taken.
@@ -115,6 +139,7 @@ impl Default for LoadOptions {
             dyldcrossrefs: true,
             macho_slice: None,
             pdb_path: None,
+            pdb_bytes: None,
             fid_db: None,
             flirt_sigs: Vec::new(),
             go_version: None,
@@ -147,6 +172,7 @@ impl LoadOptions {
             dyldcrossrefs: env::dyldcrossrefs(),
             macho_slice: env::macho_slice(),
             pdb_path: env::pdb_path(),
+            pdb_bytes: None,
             fid_db: env::fid_db(),
             flirt_sigs: env::flirt_sigs(),
             go_version: env::go_version(),

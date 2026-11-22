@@ -93,12 +93,9 @@ impl AnalysisPass for PdbPass {
             return out;
         };
         // 2. Locate: the ordered candidate list (explicit `kuna_pdb_path`, then the
-        //    record's own filename beside the image, then `<stem>.pdb`). Empty ⇒
-        //    inert.
+        //    record's own filename beside the image, then `<stem>.pdb`). Empty,
+        //    with no `.pdb` handed over as bytes either ⇒ inert (below).
         let candidates = locate::pdb_candidates(ctx.image_path, &cv);
-        if candidates.is_empty() {
-            return out;
-        }
         // The RVA→VMA addend: the PE ImageBase. Absent (unparsable) ⇒ inert.
         let Some(image_base) = pe_image_base(ctx.bytes) else {
             return out;
@@ -140,11 +137,31 @@ impl AnalysisPass for PdbPass {
     }
 }
 
-/// Open the first candidate `.pdb` whose own `{guid, age}` matches the PE's
-/// CodeView record, or `None` when the list is exhausted.
+/// Where an opened `.pdb` is read from: a file on disk, or bytes a host read
+/// for the image ([`kuna_decomp::kuna_loadoptions::PdbBytes`]).
+pub trait PdbStream: std::io::Read + std::io::Seek + std::fmt::Debug {}
+
+impl<T: std::io::Read + std::io::Seek + std::fmt::Debug> PdbStream for T {}
+
+/// An opened `.pdb`, whichever source it came from.
+pub type OpenedPdb = pdb::PDB<'static, Box<dyn PdbStream>>;
+
+/// A `.pdb` handed over as bytes: [`std::io::Cursor`] over the shared content.
+#[derive(Debug)]
+struct SharedBytes(std::sync::Arc<[u8]>);
+
+impl AsRef<[u8]> for SharedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+/// Open the `.pdb` whose own `{guid, age}` matches the PE's CodeView record:
+/// the one the load was handed as bytes (`LoadOptions::pdb_bytes`), else the
+/// first of `candidates`; `None` when none matches.
 ///
 /// A candidate that does not exist is silently skipped — most images have no
-/// sidecar and that is not a defect. A candidate that IS there but does not match
+/// sidecar and that is not a defect. A `.pdb` that IS there but does not match
 /// gets one line on stderr: with the search automatic, a stale `.pdb` left beside
 /// a rebuilt binary is otherwise indistinguishable from having no `.pdb` at all,
 /// and silence sends the user hunting for a pass that is working exactly as
@@ -152,12 +169,26 @@ impl AnalysisPass for PdbPass {
 pub(crate) fn open_fingerprint_matched(
     candidates: &[std::path::PathBuf],
     cv: &codeview::CodeViewInfo,
-) -> Option<pdb::PDB<'static, std::fs::File>> {
-    for path in candidates {
-        let Ok(file) = std::fs::File::open(path) else {
+) -> Option<OpenedPdb> {
+    let handed_over = kuna_decomp::kuna_loadoptions::scoped(|o| o.pdb_bytes.clone()).flatten();
+    let sources = handed_over
+        .map(|bytes| {
+            let stream: Box<dyn PdbStream> =
+                Box::new(std::io::Cursor::new(SharedBytes(bytes.0)));
+            ("the .pdb handed over".to_string(), Some(stream))
+        })
+        .into_iter()
+        .chain(candidates.iter().map(|path| {
+            let stream = std::fs::File::open(path)
+                .ok()
+                .map(|file| Box::new(file) as Box<dyn PdbStream>);
+            (path.display().to_string(), stream)
+        }));
+    for (label, stream) in sources {
+        let Some(stream) = stream else {
             continue;
         };
-        let Ok(mut pdb) = pdb::PDB::open(file) else {
+        let Ok(mut pdb) = pdb::PDB::open(stream) else {
             continue;
         };
         let Ok(info) = pdb.pdb_information() else {
@@ -168,11 +199,10 @@ pub(crate) fn open_fingerprint_matched(
             return Some(pdb);
         }
         kuna_base::notes::say_once(
-            &path.display().to_string(),
+            &label,
             &format!(
-                "[kuna pdb] {}: age {} guid {} does not match the image's CodeView record \
+                "[kuna pdb] {label}: age {} guid {} does not match the image's CodeView record \
                  (age {} guid {}); not applied",
-                path.display(),
                 info.age,
                 guid.to_uppercase(),
                 cv.age(),

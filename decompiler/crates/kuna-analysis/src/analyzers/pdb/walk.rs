@@ -38,7 +38,10 @@ pub struct PdbFunc {
 /// the never-fail analysis-pass contract); a stream-level error yields whatever was
 /// collected so far. Procedures are preferred over publics at the same VMA (a
 /// procedure carries the clean un-decorated name), deduped by the caller.
-pub fn walk_functions(pdb: &mut pdb::PDB<'_, std::fs::File>, image_base: u64) -> Vec<PdbFunc> {
+pub fn walk_functions<'s, S: pdb::Source<'s> + 's>(
+    pdb: &mut pdb::PDB<'s, S>,
+    image_base: u64,
+) -> Vec<PdbFunc> {
     let mut out: Vec<PdbFunc> = Vec::new();
 
     // The address map turns an internal segment:offset into an RVA. Without it we
@@ -80,8 +83,8 @@ pub struct PdbProcedure {
 /// procedure's end is recorded. A record whose start does not resolve to an RVA is
 /// skipped; a module whose stream fails to parse contributes whatever it yielded
 /// before the failure.
-pub fn walk_procedures(
-    pdb: &mut pdb::PDB<'_, std::fs::File>,
+pub fn walk_procedures<'s, S: pdb::Source<'s> + 's>(
+    pdb: &mut pdb::PDB<'s, S>,
     image_base: u64,
 ) -> Vec<PdbProcedure> {
     let mut out: Vec<PdbProcedure> = Vec::new();

@@ -57,7 +57,9 @@ const COMPUTE_NAME: &str = "pdb_demo_compute";
 const PDB_PATH_ENV: &str = "kuna_pdb_path";
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..").canonicalize().unwrap()
+    // Not canonicalized: on Windows that makes a `\\?\` path, which the spec
+    // search does not resolve (as in `verify_cancel`).
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..")
 }
 
 fn fixtures() -> PathBuf {
@@ -289,4 +291,37 @@ fn pdb_cpp_publics_are_demangled() {
         .map(|entry| entry.addr.get_offset())
         .collect();
     assert_eq!(deletes, [0x140001030, 0x140001040], "both overloads are listed");
+}
+
+/// (kuna `pdb` from bytes) A host that may open no file — a confined viewer —
+/// hands Kuna the EXE and its `.pdb` as bytes, under a name that is no path:
+/// the function is named from the handed-over `.pdb`. A `.pdb` that is not
+/// this image's is refused by the same GUID/age gate, bytes or not.
+#[test]
+fn pdb_handed_over_as_bytes_names_the_function() {
+    use kuna_console::engine::{language_database, Bootstrap};
+    use kuna_decomp::kuna_loadoptions::{LoadOptions, PdbBytes};
+
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    std::env::remove_var(PDB_PATH_ENV);
+    let specs = vec![repo_root().join("specs").to_str().unwrap().to_string()];
+    let db = language_database(&specs).unwrap();
+    let exe = std::fs::read(fixtures().join("pdb_prog.exe")).expect("read the PE");
+    let load = |pdb: &str| {
+        let bytes = std::fs::read(fixtures().join(pdb)).expect("read the .pdb");
+        let options = LoadOptions {
+            pdb_bytes: Some(PdbBytes(bytes.into())),
+            ..LoadOptions::default()
+        };
+        let mut prog = Bootstrap::new(&db)
+            .options(&options)
+            .image_bytes("handed over", exe.clone())
+            .expect("the PE loads from bytes");
+        prog.commit_pending_analysis().expect("analysis commit succeeds");
+        name_at_compute(&prog)
+    };
+
+    assert_eq!(load("pdb_prog.pdb"), COMPUTE_NAME);
+    let stale = load("pdb_prog_mismatch.pdb");
+    assert!(is_placeholder(&stale), "a stale .pdb was applied: {stale}");
 }
