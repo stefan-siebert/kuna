@@ -3233,6 +3233,12 @@ impl ConsoleProgram {
         // `functab` is the linker's own extent for every function), so the merged
         // list is normalized here before the lookup, which expects sorted disjoint
         // ranges.
+        // (kuna cancel) A host that took the analysis back gets nothing from it:
+        // the walks stopped early, so what they found is incomplete and is never
+        // committed. The program is the host's to drop.
+        if kuna_decomp::kuna_cancel::requested() {
+            return Err(KunaError::lowlevel(kuna_decomp::kuna_cancel::CANCELLED));
+        }
         let mut fde_bodies = std::mem::take(&mut merged.fde_bodies);
         fde_bodies.sort_unstable();
         kuna_analysis::entry::kuna_fdeinterior::suppress_interior_entries(

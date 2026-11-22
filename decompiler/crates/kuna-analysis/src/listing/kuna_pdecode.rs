@@ -61,6 +61,17 @@ use super::ListingDetail;
 /// How many decode lanes the walk should use. Set by `kuna --jobs N` for the
 /// duration of the load; absent means the serial walk.
 pub const DECODE_JOBS_ENV: &str = "KUNA_DECODE_JOBS";
+/// The decode lanes of a walk [`DECODE_JOBS_ENV`] sets none for.
+static DEFAULT_DECODE_LANES: AtomicUsize = AtomicUsize::new(1);
+
+/// Give every walk of this process that [`DECODE_JOBS_ENV`] sets no lanes for
+/// `lanes` of them (1 is the serial walk, the default). For a program that
+/// embeds Kuna and cannot set the variable before its threads start; the CLI
+/// exports the variable instead. The variable, where set, still wins.
+pub fn set_default_decode_lanes(lanes: usize) {
+    DEFAULT_DECODE_LANES.store(lanes.max(1), Ordering::Relaxed);
+}
+
 /// Lower the [`Refusal::TooSmall`] floor (tests set `0`).
 pub const DECODE_MIN_BYTES_ENV: &str = "KUNA_DECODE_MIN_BYTES";
 /// Override the intervals-per-lane cut (measurement / tests).
@@ -207,10 +218,13 @@ impl WalkPlan {
         }
     }
 
-    /// The plan [`DECODE_JOBS_ENV`] asks for. The only place the decode-lane
+    /// The plan [`DECODE_JOBS_ENV`] asks for, or else the process default
+    /// ([`set_default_decode_lanes`]). The only place the decode-lane
     /// environment is read.
     pub fn from_env(arch: &Architecture) -> WalkPlan {
-        let lanes = env_usize(DECODE_JOBS_ENV).unwrap_or(1).min(MAX_DECODE_LANES);
+        let lanes = env_usize(DECODE_JOBS_ENV)
+            .unwrap_or_else(|| DEFAULT_DECODE_LANES.load(Ordering::Relaxed))
+            .min(MAX_DECODE_LANES);
         let per_lane = env_usize(DECODE_INTERVALS_ENV)
             .filter(|&n| n > 0)
             .unwrap_or(INTERVALS_PER_LANE);
@@ -584,6 +598,13 @@ fn run_interval(
         local_func: Vec::new(),
     };
     loop {
+        // (kuna cancel) A lane the host took back stops taking functions. It
+        // files no more crossings, so the round ends as a quiescent one would,
+        // and the walk returns what it has -- not a refusal, which would run
+        // the serial walk over again.
+        if kuna_decomp::kuna_cancel::requested() {
+            break;
+        }
         if let Some(entry) = st.roots.pop().or_else(|| router.local_func.pop()) {
             if !st.visited.insert(entry) {
                 continue; // already walked this function
@@ -853,6 +874,8 @@ fn run(
     // `Architecture`, the parent's translator and its `Rc<AddrSpace>` stay on
     // this thread, and each lane builds its own engine and space instead.
     let seed = admitted.seed;
+    // (kuna cancel) The token is per thread; each lane runs under this one's.
+    let cancel = kuna_decomp::kuna_cancel::current();
     let exec_ranges = inputs.exec_ranges;
     let local_entries = inputs.local_entries;
     let tail_transfers = inputs.tail_transfers;
@@ -860,6 +883,7 @@ fn run(
     let detail = inputs.detail;
 
     let body = |me: usize, kit: Option<Kit>| -> Result<bool, Refusal> {
+        let _cancel = kuna_decomp::kuna_cancel::CancelScope::enter(cancel.clone());
         let kit = match kit {
             Some(k) => k,
             None => build_kit(seed)?,

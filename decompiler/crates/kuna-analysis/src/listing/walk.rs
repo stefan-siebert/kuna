@@ -635,6 +635,11 @@ fn walk_serial(
     }
 
     while let Some(entry) = func_worklist.pop() {
+        // (kuna cancel) A walk the host took back ends here, with what it has;
+        // whoever drives the analysis commits nothing from it.
+        if kuna_decomp::kuna_cancel::requested() {
+            break;
+        }
         if !visited_funcs.insert(entry) {
             continue; // already walked this function
         }
@@ -712,13 +717,17 @@ fn walk_carried(
     loop {
         walk_items(ctx, &mut modes, std::mem::take(&mut resumed), func_worklist, sinks);
         while let Some(entry) = func_worklist.pop() {
+            // (kuna cancel) As in `walk_serial`.
+            if kuna_decomp::kuna_cancel::requested() {
+                break;
+            }
             if visited_funcs.insert(entry) {
                 let start = vec![(entry, modes.entry(entry))];
                 walk_items(ctx, &mut modes, start, func_worklist, sinks);
             }
         }
         resumed = modes.resume(arch, ctx.code_space, sinks.insns);
-        if resumed.is_empty() {
+        if resumed.is_empty() || kuna_decomp::kuna_cancel::requested() {
             break;
         }
     }

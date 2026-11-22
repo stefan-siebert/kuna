@@ -896,10 +896,12 @@ pub fn build_and_follow_flow_within_budget(
 }
 
 /// (kuna decompile-all watchdog) Did `error` stop a drive at its budget or
-/// memory limit ([`budget_error`])?
+/// memory limit, or because the host cancelled it ([`budget_error`])?
 pub fn is_budget_stop(error: &KunaError) -> bool {
     let text = error.explain();
-    text.starts_with(BUDGET_EXCEEDED) || text.starts_with(MEMORY_EXCEEDED)
+    text.starts_with(BUDGET_EXCEEDED)
+        || text.starts_with(MEMORY_EXCEEDED)
+        || text.starts_with(crate::kuna_cancel::CANCELLED)
 }
 
 /// (kuna decompile-all watchdog) The un-decompiled `Funcdata` a console keeps
@@ -938,6 +940,7 @@ fn within_flow_budget<T>(
     let horizon = match fn_budget(arch) {
         Some(budget) => budget,
         None if memory.as_ref().is_some_and(|guard| guard.is_armed()) => MEMORY_ONLY_HORIZON,
+        None if crate::kuna_cancel::armed() => MEMORY_ONLY_HORIZON,
         None => return follow(arch),
     };
     let outer = arch.kuna_fn_deadline.replace(std::time::Instant::now() + horizon);
@@ -1877,6 +1880,7 @@ fn decompile_func_full_with_objects_inner(
     let requested_deadline = match fn_budget(arch) {
         Some(budget) => Some(now + budget.saturating_sub(followed)),
         None if memory.as_ref().is_some_and(|guard| guard.is_armed()) => Some(now + MEMORY_ONLY_HORIZON),
+        None if crate::kuna_cancel::armed() => Some(now + MEMORY_ONLY_HORIZON),
         None => None,
     };
     arch.kuna_fn_deadline = match (outer_deadline, requested_deadline) {
@@ -3532,15 +3536,17 @@ impl Drop for JumpTableScope {
 }
 
 /// (kuna decompile-all watchdog) The one test every cooperative probe makes:
-/// the clock passed `deadline`, or the drive went over its memory limit
-/// ([`crate::kuna_fnmemory::over`]).
+/// the clock passed `deadline`, the drive went over its memory limit
+/// ([`crate::kuna_fnmemory::over`]), or the host cancelled it
+/// ([`crate::kuna_cancel::requested`]).
 pub(crate) fn budget_spent(deadline: std::time::Instant) -> bool {
     let now = std::time::Instant::now();
-    now >= deadline || crate::kuna_fnmemory::over(now)
+    now >= deadline || crate::kuna_fnmemory::over(now) || crate::kuna_cancel::requested()
 }
 
-/// How far out a drive armed only by a memory limit puts its deadline, so the
-/// probes that ask about memory run without a wall-clock budget.
+/// How far out a drive armed only by a memory limit or a cancel token puts its
+/// deadline, so the probes that ask about either run without a wall-clock
+/// budget.
 const MEMORY_ONLY_HORIZON: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 3600);
 
 /// (kuna decompile-all watchdog) The per-function error for a budgeted drive
@@ -3548,6 +3554,9 @@ const MEMORY_ONLY_HORIZON: std::time::Duration = std::time::Duration::from_secs(
 /// cut-off pipeline left behind is never printed.
 fn budget_error(arch: &Architecture) -> Option<KunaError> {
     let deadline = arch.kuna_fn_deadline?;
+    if crate::kuna_cancel::requested() {
+        return Some(KunaError::lowlevel(crate::kuna_cancel::CANCELLED));
+    }
     if let Some(mib) = crate::kuna_fnmemory::tripped_limit_mib() {
         return Some(KunaError::lowlevel(format!("{MEMORY_EXCEEDED} ({mib} MiB)")));
     }
@@ -3592,6 +3601,9 @@ impl RenderBudget {
     pub fn error(&self) -> Option<KunaError> {
         if !self.spent_in("rendering C") {
             return None;
+        }
+        if crate::kuna_cancel::requested() {
+            return Some(KunaError::lowlevel(crate::kuna_cancel::CANCELLED));
         }
         let site = FN_BUDGET_SITE.with(|s| s.borrow().clone()).unwrap_or_default();
         Some(KunaError::lowlevel(format!("{BUDGET_EXCEEDED} ({} s) in {site}", self.secs)))

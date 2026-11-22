@@ -991,6 +991,11 @@ pub fn run_listing_consumers_replaying_observed(
             );
         }
     }
+    // (kuna cancel) A walk the host took back stopped early; nothing built on
+    // it is wanted, and the commit refuses it (`commit_pending_analysis`).
+    if kuna_decomp::kuna_cancel::requested() {
+        return Vec::new();
+    }
     // (kuna `thunkentry`, `addrtakenentry`) Where the walk's own function set is
     // committed (`funcdisc_recursive`, `fast_funcdisc`).
     let walk_committed = (arch.analysis_listing && arch.analysis_funcstart_patterns)
